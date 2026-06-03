@@ -19,3 +19,13 @@ def get_vertex_embedding(text: str):
     except Exception as e:
         print(f"Error generating embedding: {e}")
         return None
+    
+
+if __name__ == "__main__":
+    test_text = "Classic Leather Cafe Racer Jacket - Premium Quality"
+    print("Testing Vertex AI Embeddings...")
+    vector = get_vertex_embedding(test_text)
+    
+    if vector:
+        print(f"Success! Generated a vector of length: {len(vector)}")
+        print(f"First few numbers of the vector: {vector[:5]}")
