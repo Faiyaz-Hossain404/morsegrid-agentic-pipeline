@@ -10,7 +10,7 @@ def get_db_client():
     if not uri:
         raise ValueError("MONGODB_URI missing from environment variables")
     try:
-        client = MongoClient(uri, serverSelectioinTimeoutMS=10000)
+        client = MongoClient(uri, serverSelectionTimeoutMS=10000)
         return client
     except Exception as e:
         print(f"Failed to parse MongoDB connection URI: {e}")
@@ -32,3 +32,6 @@ def test_connection():
             print(f"Connection error: Could not reach Atlas cluster.\n{e}")
         finally:
             client.close()
+
+if __name__ == "__main__":
+    test_connection()
