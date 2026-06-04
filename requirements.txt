@@ -1,0 +1,8 @@
+google-cloud-aiplatform
+vertexai
+pymongo[srv]
+python-dotenv
+flask
+requests
+streamlit
+sendgrid
