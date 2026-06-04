@@ -15,3 +15,20 @@ def get_db_client():
     except Exception as e:
         print(f"Failed to parse MongoDB connection URI: {e}")
         return None
+    
+
+def test_connection():
+    """Verifies connection status to the cluster."""
+    print("Connecting to MongoDB Atlas...")
+    client = get_db_client()
+    if client:
+        try:
+            client.admin.command('ping')
+            print("Successfully connected to MongoDB Atlas.")
+
+            db = client['morsegrid_outfitters']
+            print(f"Database context targeted: '{db.name}'")
+        except Exception as e:
+            print(f"Connection error: Could not reach Atlas cluster.\n{e}")
+        finally:
+            client.close()
