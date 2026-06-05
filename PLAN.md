@@ -1,10 +1,30 @@
 # Morsegrid Outfitters — Ecommerce Re-engagement Agent
 ### Build Plan (start → submission)
 
-> **Hackathon:** Google Cloud Rapid Agent Hackathon — **MongoDB Track**
-> **Deadline:** **2026-06-11, 2:00 PM PT** (today: 2026-06-04 → ~7 days left)
+> **Hackathon:** Building Agents for Real-World Challenges (Google Cloud) — **MongoDB Partner Track**
+> **Prize bucket:** MongoDB ($5k / $3k / $2k) — judged only against other MongoDB-track builds
+> **Deadline:** **2026-06-11, 2:00 PM PT** · **Personal target: 4 working days → done ~Jun 8**, leaving Jun 9–11 as buffer
 > **Owners:** Maks (narrative + agent prompts + video) · Sifath (full-stack build + infra)
 > **Repo:** `d:\hackathon\` (standalone git repo — no edits to Morsegrid production scripts)
+
+---
+
+## 0. Eligibility — HARD REQUIREMENTS (do not violate)
+
+These come straight from the official rules. Missing any one = disqualified.
+
+| # | Requirement | How we satisfy it |
+|---|---|---|
+| 1 | **Built with Gemini 3** ("Gemini provides the brain") | All three agents reason with **Gemini 3** (e.g. `gemini-3-pro`) on Vertex AI |
+| 2 | **Google Cloud Agent Builder** | Agents built with **ADK** (Agent Development Kit — the code-first framework of Google Cloud's Agent Builder stack), deployed to **Vertex AI Agent Engine** |
+| 3 | **Meaningful partner MCP integration** ⭐ | Agents read/write MongoDB **exclusively through the MongoDB MCP server** (`mongodb-mcp-server`) — find / aggregate / count / insert / update. **This is the eligibility linchpin.** |
+| 4 | **Beyond chat — uses tools to accomplish tasks** | Agents query a live DB, run vector search, send a real email, log results |
+| 5 | **Multi-step mission — plan + execute** | Planner → Nurturer → Sender pipeline plans who/what/how and finishes the job |
+| 6 | **Keeps the human in control** | Dashboard shows every draft + decision; **review-and-approve before send** (human-in-the-loop mode for the demo) |
+
+> ⚠️ **Earlier draft mistakenly accessed MongoDB via raw pymongo from the agents — that
+> would have failed requirement #3.** Corrected here: the **agent runtime touches MongoDB
+> only via the MongoDB MCP server.** (Offline ETL scripts may still use pymongo — see §5.)
 
 ---
 
@@ -12,10 +32,11 @@
 
 An **agent-based re-engagement system** for a demo motorcycle-gear store ("Morsegrid
 Outfitters"). Instead of deterministic flows (Klaviyo/Postscript) that fire the same
-template at everyone, three cooperating agents **reason across each customer's full
-history + the product catalog + recency**, decide who to contact, draft a personalized
-message, and pick the right channel. The wedge: *agent that reasons across history and
-channels* — client-owned, not SaaS (Markopolo-style framing).
+template at everyone, three cooperating **Gemini 3** agents **reason across each
+customer's full history + the product catalog + recency** — pulling that context from
+**MongoDB via the MongoDB MCP server** — then decide who to contact, draft a personalized
+message, and pick the right channel, with a human approving sends. The wedge: *an agent
+that reasons across history and channels* — client-owned, not SaaS.
 
 ---
 
@@ -24,22 +45,26 @@ channels* — client-owned, not SaaS (Markopolo-style framing).
 | Decision | Choice | Why |
 |---|---|---|
 | **Build tier** | **Safe-ship multi-agent** | Highest odds of a finished, impressive submission in 7 days |
-| **Agent protocol** | **Direct ADK agent-to-agent calls** (NOT the A2A protocol) | A2A kill-date (May 26) already passed; A2A is the riskiest, lowest-ROI integration. Stretch goal only if everything ships early |
+| **Model** | **Gemini 3** (Vertex AI) | Eligibility req #1 |
+| **Build framework** | **ADK / Google Cloud Agent Builder** → Agent Engine | Eligibility req #2 |
+| **MongoDB access** | **MongoDB MCP server only** (from the agents) | Eligibility req #3 — the partner integration |
+| **Inter-agent wiring** | **Direct ADK calls** (NOT the A2A protocol) | A2A kill-date passed; not required by the rules; riskiest integration |
 | **Email** | **Real send** (SendGrid) | Proves a live channel; lands in a test inbox |
-| **SMS / Instagram DM** | **Mocked in the UI** | Drafted message shown + labeled *"would send via Twilio / Meta API"*. Avoids Meta approval + Twilio verification delays |
-| **ROI feature** | **EV-based lead ranking** | The Planner ranks by `P(convert) × margin × recency`, not vague "intent" — the visible "smart" behavior |
-| **Dashboard** | **Live, hosted** | Shows agent reasoning, tool calls, channel decisions in real time |
-| **Data** | **100% synthetic** | No real client data; ~18 customers, ~50 products, ~200 events |
+| **SMS / Instagram DM** | **Mocked in the UI** | Drafted message shown + labeled *"would send via Twilio / Meta API"*. Avoids approval/verification delays |
+| **ROI feature** | **EV-based lead ranking** | Planner ranks by `P(convert) × margin × recency` — the visible "smart" behavior |
+| **Human-in-the-loop** | **Review + approve sends** | Eligibility req #6 (and a better demo) |
+| **Dashboard** | **Local Streamlit for demo** (hosted = stretch) | Shows agent reasoning, MCP tool calls, channel decisions in real time |
+| **Deployment** | **Run local for the video** (Cloud Run / Agent Engine = stretch) | 4-day timeline — deployment is not required to demo a working agent |
+| **Data** | **100% synthetic** | ~18 customers, ~50 products, ~200 events |
 
-**Deselected (optional fast-follows if time frees up):** margin-aware discount decisioning,
-cart-abandonment hero scenario, holdout + "$ incremental revenue" readout. *Note: products
-keep a `cost`/`margin` field anyway, so these can be added later with zero rework.*
+**Deselected (optional fast-follows):** margin-aware discounting, cart-abandon hero
+scenario, holdout + "$ incremental revenue" readout. *Products keep `cost`/`margin`
+fields anyway, so these add later with zero rework.*
 
 ### Honest framing (for the pitch)
-This is **retention / re-engagement**, not strictly **CRO**. The demo proves *capability*
-(the agent reasons + picks a channel). EV ranking is what makes it read as a *business*
-decision rather than a chatbot. The single cheapest way to later prove *ROI* would be a
-simulated holdout group with an incremental-revenue number — deferred for now.
+This is **retention / re-engagement**, not strictly **CRO**. The demo proves *capability*;
+EV ranking makes it read as a *business* decision. The cheapest later ROI proof is a
+simulated holdout with an incremental-revenue number — deferred.
 
 ---
 
@@ -47,32 +72,40 @@ simulated holdout group with an incremental-revenue number — deferred for now.
 
 ```
    Demo store (signup form + chat widget)
-                │  POST lead / behavior event
-                ▼
-        Webhook  (server)  ──────────────► MongoDB Atlas
-                │                            customers · behavior_events
-                ▼                            products · orders · messages_sent
-        ┌───────────────┐                    (+ vector indexes on
-        │  PLANNER      │  decides WHO         desc_vector & behavior_vector)
-        │  agent        │  → ranked queue            ▲
-        └──────┬────────┘  (EV ranking)              │ tools read/write
-               │ direct call (per lead)              │
-        ┌──────▼────────┐                            │
-        │  NURTURER     │  decides WHAT  ────────────┤ vector product match
-        │  agent        │  → drafted message         │
-        └──────┬────────┘                            │
-               │ direct call                         │
-        ┌──────▼────────┐                            │
-        │  SENDER       │  decides CHANNEL ──────────┘
-        │  agent        │  → email (real) / SMS·IG (mock) → log
-        └──────┬────────┘
-               ▼
-        Live dashboard  (queue · reasoning trace · channel decision · send log)
+            │  POST lead / behavior event
+            ▼
+        Webhook ───────────────────────────────► triggers the agent app
+            │
+            ▼
+   ╔══════════════════════════════════════════════════════════╗
+   ║   ADK multi-agent app   ·   model: GEMINI 3               ║
+   ║                                                          ║
+   ║     PLANNER  ──►  NURTURER  ──►  SENDER                   ║
+   ║     (who)         (what)         (which channel)          ║
+   ║        │             │              │                     ║
+   ║        ├── MCP ──────┼── MCP ───────┼── MCP (log)         ║
+   ║        │             │              │                     ║
+   ║        └ score_lead  └ embed_query  └ pick_channel        ║
+   ║          _ev (EV)      (Vertex)       send_email (real)   ║
+   ║                        + vector       send_sms/ig (mock)  ║
+   ╚════════════════════════╪═════════════════════════════════╝
+                            │  ALL MongoDB ops go through ↓
+                  ┌───────────────────────────┐
+                  │   MongoDB MCP server       │  ← partner integration (mandatory)
+                  │   find · aggregate · count │
+                  │   insert-many · update-many│
+                  └─────────────┬─────────────┘
+                                ▼
+                       MongoDB Atlas
+        customers · behavior_events · products · orders · messages_sent
+              (+ vector indexes on desc_vector & behavior_vector)
+                                ▲
+                                │ offline ETL only (pymongo): seed + embed + create indexes
 ```
 
-Orchestration = ADK `SequentialAgent` (or plain Python runner calls): **Planner → Nurturer
-→ Sender**. Every agent's tool calls + output are captured into an `agent_trace` — that
-trace is the demo.
+Orchestration = ADK `SequentialAgent` (or plain runner calls): **Planner → Nurturer →
+Sender**. Every agent's MCP + custom tool calls and outputs are captured into an
+`agent_trace` — that trace (with visible MCP calls) is the demo *and* the proof of req #3.
 
 ---
 
@@ -95,134 +128,150 @@ products
   in_stock, tags[], created_at, restocked_at?
   (title+description+category+tags) ──embed──► desc_vector [768]
 
-orders
-  _id, customer_id, items[ {product_id, price, qty} ], total, ts
-
-messages_sent
-  _id, customer_id, channel, subject?, body, status (sent|mock|queued),
-  reasoning, agent_trace, ts
+orders          _id, customer_id, items[ {product_id, price, qty} ], total, ts
+messages_sent   _id, customer_id, channel, subject?, body,
+                status (sent|mock|queued|approved), reasoning, agent_trace, ts
 ```
 
-**Vector indexes:** `768` dims, `cosine` similarity — on `products.desc_vector`
+**Vector indexes:** `768` dims, `cosine` — on `products.desc_vector`
 (`products_vector_index`) and `customers.behavior_vector` (`customers_vector_index`).
 
 ---
 
 ## 5. Components to build
 
-| Module (responsibility) | Notes |
-|---|---|
-| **embeddings** | Wrap Vertex `text-embedding-004`. `RETRIEVAL_DOCUMENT` for stored docs, `RETRIEVAL_QUERY` for live queries. *(✅ base version already working)* |
-| **db / mongo** | Atlas client + collection accessors + ping |
-| **seed data** | Generate synthetic store, write to MongoDB (no vectors) |
-| **build index** | Embed product + customer docs, write vectors, create vector indexes, verify query |
-| **tools** | Deterministic functions the agents call (see §6) |
-| **agents** | Planner / Nurturer / Sender + orchestrator (see §7) |
-| **server** | Webhook: capture → trigger orchestrator; read API for dashboard |
-| **dashboard** | Streamlit: queue, EV rationale, reasoning trace, channel decision, send log |
-| **store** | Demo storefront page + signup form + chat widget |
+| Component | Path | Talks to MongoDB via | Notes |
+|---|---|---|---|
+| **embeddings** | (built ✅) | — | Vertex `text-embedding-004`; `RETRIEVAL_DOCUMENT` for docs, `RETRIEVAL_QUERY` for live queries |
+| **seed data** (ETL) | offline | **pymongo** (allowed — not agent path) | ~18 customers, ~50 products, ~200 events |
+| **build index** (ETL) | offline | **pymongo** (allowed) | embed docs, write vectors, create vector indexes |
+| **MongoDB MCP server** | external (`npx mongodb-mcp-server`) | — | ⭐ the partner integration; the agents' only DB door |
+| **tools** | code | via MCP / Vertex | EV scoring, embed_query, channel pick, email/mocks |
+| **agents** | code | **MCP** (via ADK MCPToolset) | Planner / Nurturer / Sender, Gemini 3 |
+| **server** | code | via agents | webhook + read API for dashboard |
+| **dashboard** | code | read API | Streamlit: queue, trace, MCP calls, approve+send |
+| **store** | code | webhook | signup form + chat widget |
 
-*File layout (flat or foldered) is adjustable — TBD before coding.*
+> **Why ETL uses pymongo but agents use MCP:** the MCP requirement is about the *agent's*
+> integration ("give your agent the superpowers"). Seeding/indexing is dev-time setup, not
+> an agent action — pymongo there is fine and more reliable for creating Atlas vector
+> indexes. Every *runtime* DB op the agents perform goes through the MongoDB MCP server.
+
+*File layout (flat vs foldered) still TBD — does not affect this plan.*
 
 ---
 
-## 6. Tools (what the agents can call)
+## 6. Tools
 
+### MongoDB MCP server tools (partner integration — used by the agents)
+| Tool | Used by | For |
+|---|---|---|
+| `find` | Planner, Nurturer | active leads, customer history, orders/events |
+| `aggregate` | Planner, Nurturer | analytics + **`$vectorSearch`** product match |
+| `count` | Planner | recent-message / fatigue checks |
+| `insert-many` | Sender | write `messages_sent` (with reasoning + trace) |
+| `update-many` | Sender/Planner | flag "nurtured today" |
+
+### Custom tools (our logic, alongside MCP)
 | Tool | Used by | Returns |
 |---|---|---|
-| `get_active_leads(limit)` | Planner | candidate customers needing nurture |
-| `score_lead_ev(customer_id)` | Planner | `{score, p_convert, margin_est, recency_factor, rationale}` ← **EV ranking** |
-| `get_customer_history(customer_id)` | Nurturer | orders + events + summary |
-| `search_matching_products(query\|customer_id, k)` | Nurturer | top-k via `$vectorSearch` |
-| `get_engagement_pattern(customer_id)` | Nurturer/Sender | open rate, best-channel hint |
-| `pick_channel(customer_id)` | Sender | `email` \| `sms` \| `ig_dm` |
+| `embed_query(text)` | Nurturer | 768-d Vertex query vector → fed into the MCP `$vectorSearch` |
+| `score_lead_ev(lead)` | Planner | `{score, p_convert, margin_est, recency_factor, rationale}` ← **EV ranking** |
+| `pick_channel(customer)` | Sender | `email` \| `sms` \| `ig_dm` |
 | `send_email(to, subject, body)` | Sender | **REAL** (SendGrid) |
-| `send_sms(to, body)` / `send_ig_dm(handle, body)` | Sender | **MOCK** — log + return `"mock"` |
-| `log_send(...)` | Sender | writes `messages_sent` (incl. reasoning + trace) |
+| `send_sms` / `send_ig_dm` | Sender | **MOCK** — returns `"mock"`, shown in UI |
+
+> **Vector-search-through-MCP detail (resolve Day 2–3):** the LLM should not hand-type a
+> 768-float vector. Approach: `embed_query` produces the vector and the product-match step
+> runs the `$vectorSearch` pipeline through the **MongoDB MCP `aggregate`** path (thin
+> wrapper injects the vector). Net: the query still resolves on MongoDB via MCP.
 
 ---
 
-## 7. Agents
+## 7. Agents (Gemini 3, via ADK + MCPToolset)
 
-- **Planner** — triggered on schedule or webhook. Calls `get_active_leads` then
-  `score_lead_ev` per lead → returns a **ranked queue** (highest expected value first),
-  each with a one-line rationale shown on the dashboard.
-- **Nurturer** — per queued lead: `get_customer_history`, `search_matching_products`
-  (vector), `get_engagement_pattern` → LLM drafts a contextual message + reasoning trace.
-- **Sender** — `pick_channel` from engagement → `send_email` (real) or `send_sms`/
-  `send_ig_dm` (mock) → `log_send`. Visibly explains the channel choice.
+- **Planner** — triggered on schedule/webhook. MCP `find`/`aggregate` for candidate leads →
+  custom `score_lead_ev` per lead → **ranked queue** (highest EV first) + one-line rationale.
+- **Nurturer** — per lead: MCP `find` (history) + `embed_query` + MCP `aggregate`
+  (`$vectorSearch`) for product match → Gemini 3 drafts a contextual message + reasoning.
+- **Sender** — `pick_channel` from engagement → `send_email` (real) or mock SMS/IG →
+  MCP `insert-many` to log. **Awaits human approval in the dashboard before real send.**
 
 ---
 
 ## 8. Demo scenarios (the 3 in the video)
 
 1. **Cross-session memory + product match** — *Mike* asked (chat) about the Rallye
-   Adventure Helmet ~2 months ago; it was out of stock. It's back in stock today. Planner
-   queues him, Nurturer drafts referencing the original inquiry, Sender picks email.
-2. **Channel switch** — *Sarah* browsed helmets but has opened 0 of her last 5 emails. A
-   new helmet drops. Sender visibly decides *"email engagement low → switch to SMS."*
+   Adventure Helmet ~2 months ago; out of stock then, **back in stock today**. Planner
+   queues him, Nurturer (vector match via MCP) drafts referencing the inquiry, Sender → email.
+2. **Channel switch** — *Sarah* browsed helmets but opened 0 of her last 5 emails. New
+   helmet drops. Sender visibly decides *"email engagement low → switch to SMS."*
 3. **Latent-want detection** — *Diego* searched "cafe racer jacket" 6 weeks ago; no match
-   then. A new arrival now fits. Agent surfaces it and drafts a "we got what you were
-   looking for" message.
+   then. A new arrival now fits (surfaced by MCP `$vectorSearch`). Agent drafts "we got
+   what you were looking for."
 
 ---
 
-## 9. Execution plan (day by day)
+## 9. Execution plan — 4 working days (Jun 4 → ~Jun 8)
 
-> Mark `[x]` as completed. Pass gate must be green before moving on.
+> **Vertical-slice strategy:** Day 1 proves the whole risky stack thin (data + ADK +
+> Gemini 3 + MCP all touching once); Days 2–3 build it wide; Day 4 ships. Finishing by
+> ~Jun 8 leaves Jun 9–11 as buffer before the hard 2 PM PT deadline.
+> **Cut to fit 4 days (→ Stretch):** hosted URL / Cloud Run + Agent Engine deploy, full
+> storefront UI, real Twilio SMS. **Kept:** everything eligibility needs + the wedge.
 
-### Day 1 · Jun 4–5 — Data layer
-- [ ] `requirements.txt` (pin installed + add google-adk, sendgrid, streamlit)
-- [ ] DB connection module + ping
-- [ ] Seed script: ~18 customers, ~50 products (with cost+margin), ~200 events, orders
-- [ ] Build-index script: embed product + customer docs, create both vector indexes
-- [ ] **Pass gate:** `$vectorSearch` aggregate returns ≥1 hit on the products index
+### Day 1 · Jun 4–5 — Foundation + de-risk the full stack
+- [ ] `requirements.txt`; DB connection module + ping
+- [ ] Seed (~18 customers, ~50 products w/ cost+margin, ~200 events, orders) — pymongo
+- [ ] Embed docs + create both vector indexes — pymongo
+- [ ] Install + **import-check `google-adk`, `sendgrid`, `streamlit` on Python 3.14** — if it fails, make a 3.12 venv NOW
+- [ ] Confirm a **`gemini-3-*`** model is available in your Vertex `LOCATION`
+- [ ] Stand up **MongoDB MCP server** (`npx`) + connect via ADK `MCPToolset`; a Gemini 3 test agent calls MCP `find`
+- [ ] **Pass gate (slice):** `$vectorSearch` returns a hit **AND** a Gemini 3 agent calls a MongoDB MCP tool. *If green, the rest is just building.*
 
-### Day 2 · Jun 6 — Tools
-- [ ] All tools in §6, incl. `score_lead_ev` (EV ranking) and `search_matching_products`
-- [ ] Real SendGrid `send_email`; mocked `send_sms` / `send_ig_dm`
-- [ ] **Pass gate:** every tool callable + smoke-tested individually
-- [ ] Verify `google-adk` installs/imports on Python 3.14 (risk — see §11)
+### Day 2 · Jun 6 — The agent pipeline (the heart)
+- [ ] Custom tools: `embed_query`, `score_lead_ev` (EV), `pick_channel`, `send_email` (real), `send_sms`/`send_ig_dm` (mock)
+- [ ] Planner / Nurturer / Sender (**Gemini 3**) using MCP tools + custom tools
+- [ ] Orchestrator (SequentialAgent / direct calls); product match via MCP `$vectorSearch`; webhook/script trigger
+- [ ] **Pass gate:** trigger → ranked queue → draft → channel → **real email lands + logged via MCP `insert-many`**; trace shows MCP calls
+- [ ] *Fallback if running long: collapse Planner+Nurturer into one "Strategist" agent (2 agents total)*
 
-### Day 3 · Jun 7 — Agents
-- [ ] Planner, Nurturer, Sender as ADK agents + orchestrator (direct calls, no A2A)
-- [ ] System prompts v1, iterated against the 3 scenarios
-- [ ] **Pass gate (smoke test):** webhook → Planner → Nurturer → Sender → message in queue (full round-trip)
+### Day 3 · Jun 7 — Dashboard + scenarios + polish
+- [ ] Streamlit dashboard: ranked queue, EV rationale, reasoning trace (**MCP calls visible**), channel decision, **approve + send**
+- [ ] Wire + rehearse the **3 scenarios** (Mike / Sarah / Diego); iterate prompts
+- [ ] **Pass gate:** dashboard shows agents firing live; all 3 scenarios run clean
 
-### Day 4 · Jun 8 — Dashboard
-- [ ] Streamlit UI: ranked queue, EV rationale, reasoning trace, channel decision, send log
-- [ ] Live updates (polling)
-- [ ] **Pass gate:** queue + reasoning trace render as agents fire
+### Day 4 · Jun 8 — Ship
+- [ ] Record + edit **≤ 3:00 video** (English captions); upload to YouTube
+- [ ] README + LICENSE (MIT) + architecture diagram (Gemini 3 + Agent Builder/ADK + MongoDB MCP)
+- [ ] Devpost writeup + links; **explicitly state the MongoDB MCP integration**
+- [ ] **Submit** (well before Jun 11, 2 PM PT)
 
-### Day 5 · Jun 9 — Capture surface + scenario wiring
-- [ ] Demo store page: signup form + chat widget → webhook → Planner trigger
-- [ ] Wire + rehearse the 3 scenarios end to end
-- [ ] **Pass gate:** real email lands in the test inbox; SMS/IG show as mock-labeled
-
-### Day 6 · Jun 10 — Deploy + record
-- [ ] Deploy backend + dashboard (Cloud Run); public URL
-- [ ] Dress rehearsals; record + edit ≤ 3:00 video; English captions; upload to YouTube
-- [ ] **Pass gate:** public dashboard URL returns 200; video uploaded
-
-### Day 7 · Jun 11 AM — Submit (buffer)
-- [ ] README + LICENSE (MIT) + architecture diagram
-- [ ] Devpost writeup + links (repo + video + live URL)
-- [ ] **Submit before 2:00 PM PT**
+### Stretch · Jun 9–11 buffer (only if Day 4 finished clean)
+- [ ] Deploy: dashboard/backend → Cloud Run (public URL); agents → Agent Engine
+- [ ] Demo storefront page (signup form + chat widget) replacing the script trigger
+- [ ] Holdout + "$ incremental revenue" readout (the ROI proof)
+- [ ] Real Twilio SMS to a verified test number
 
 ---
 
 ## 10. Pass criteria (definition of done)
 
-- [ ] Atlas cluster online; connection returns OK
-- [ ] Vector indexes created; aggregate query returns ≥1 result on each
-- [ ] Planner webhook POST returns 200; ranked queue appears in dashboard
-- [ ] Queue item shows drafted message + reasoning trace
+**Hard — required for submission + eligibility:**
+- [ ] **Built with Gemini 3** (agents call a `gemini-3-*` model)
+- [ ] **Built on Google Cloud Agent Builder / ADK**
+- [ ] **Agents perform MongoDB ops via the MongoDB MCP server** — logs/trace show MCP tool calls ⭐
+- [ ] Vector search returns results via MCP `aggregate` (`$vectorSearch`)
+- [ ] Trigger → ranked queue → drafted message + reasoning trace; human approves before send
 - [ ] Real email lands in test inbox; SMS/IG queued with "would send" label
-- [ ] Logs show inter-agent calls (Planner→Nurturer→Sender)
-- [ ] Live dashboard public URL returns 200
-- [ ] Demo video public on YouTube, ≤ 3:00, English captions
+- [ ] Trace shows inter-agent flow (Planner→Nurturer→Sender)
+- [ ] Demo video public, ≤ 3:00, English captions
 - [ ] Repo public, LICENSE present, README has setup steps
 - [ ] Devpost submission accepted before Jun 11, 2:00 PM PT
+
+**Stretch — nice to have, not blocking:**
+- [ ] Deployed to Agent Engine / Cloud Run; public dashboard URL returns 200
+- [ ] Storefront capture page; holdout + "$ incremental revenue" readout
 
 ---
 
@@ -230,39 +279,58 @@ messages_sent
 
 | Risk | Mitigation |
 |---|---|
-| **Python 3.14** — google-adk may lack wheels / support | Verify import Day 2 first thing. Fallback: pin to a 3.12 venv if ADK won't install |
-| **A2A protocol** — new, under-documented | Already dropped — use direct ADK calls. Stretch only |
-| **Meta IG approval** — 1–2 week delay | Mocked in UI, not on critical path |
-| **Twilio toll-free verification** | SMS mocked; real send only to a verified test number if attempted |
-| **Gemini rate limits during recording** | Throttle to sequential agent runs; cache responses |
-| **Atlas free-tier 512 MB** | Keep data small (~18 customers / 50 products / 200 events) |
-| **Vertex paid calls** | Embeddings are ~free (<1¢ for the whole dataset); confirm before any large reruns |
+| **MCP integration missing = disqualified** ⭐ | Agents access MongoDB *only* via MongoDB MCP server; verify MCP tool calls appear in the trace by Day 3 |
+| **Node.js dependency** (MCP server is Node, run via `npx`) | Install Node 18+ Day 1; confirm `npx -y mongodb-mcp-server` starts against Atlas |
+| **Gemini 3 model ID / region** | Confirm exact `gemini-3-*` ID available in our Vertex `LOCATION` Day 2 |
+| **Python 3.14** — google-adk / MCP toolset wheels | Verify import Day 2 first thing. Fallback: 3.12 venv |
+| **Agent Builder requirement** | ADK is the code-first Agent Builder path → Agent Engine. If judges want the low-code console, that's the fallback framing |
+| **Vector-through-MCP** (768 floats via LLM) | `embed_query` + thin aggregate wrapper, not LLM-typed vectors |
+| **MCP server permissions** (`--readOnly`, tool allow-list) | Configure to allow find/aggregate/count/insert/update on our DB only |
+| **A2A protocol** | Dropped (not required); direct ADK calls |
+| **Meta IG / Twilio** delays | Mocked; not on critical path |
+| **Gemini rate limits during recording** | Throttle to sequential runs; cache responses |
+| **Atlas free-tier 512 MB** | Keep data small (~18/50/200) |
 
 ---
 
-## 12. How to run (commands fill in as built)
+## 12. How to run (fill in as built)
 
 ```bash
-# all commands from d:\hackathon, using the venv python
+# from d:\hackathon, using the venv python + Node for the MCP server
+
+# --- offline ETL (pymongo) ---
 venv/Scripts/python.exe db/mongo.py            # 1. test Atlas connection
 venv/Scripts/python.exe data/seed_data.py      # 2. load synthetic store
-venv/Scripts/python.exe data/build_index.py    # 3. embed + create vector indexes (Day 1 pass gate)
-# (Day 3+) run orchestrator / server / streamlit dashboard — TBD
+venv/Scripts/python.exe data/build_index.py    # 3. embed + create vector indexes
+
+# --- MongoDB MCP server (partner integration) ---
+npx -y mongodb-mcp-server --connectionString "$MONGODB_URI"   # smoke test
+#   (in the agent app, this is launched/connected via ADK MCPToolset stdio)
+
+# --- agents + dashboard (Day 3+) ---
+# run orchestrator / webhook server / streamlit dashboard — TBD
 ```
 
 ---
 
-## 13. Environment variables (`.env` — already set)
+## 13. Environment variables (`.env`)
 
-`PROJECT_ID`, `LOCATION` (Vertex AI) · `MONGODB_URI` (Atlas) · `SENDGRID_API_KEY` (email) ·
-`TWILIO_SID`, `TWILIO_TOKEN`, `TWILIO_FROM` (SMS — mocked) · `META_ACCESS_TOKEN`,
-`META_PAGE_ID` (IG — mocked). Google auth via local ADC (`application_default_credentials.json`).
+`PROJECT_ID`, `LOCATION` (Vertex AI / Gemini 3) · `MONGODB_URI` (Atlas) ·
+`MDB_MCP_CONNECTION_STRING` = same as `MONGODB_URI` (MongoDB MCP server) ·
+`SENDGRID_API_KEY` (email) · `TWILIO_SID/TOKEN/FROM` (SMS — mocked) ·
+`META_ACCESS_TOKEN/PAGE_ID` (IG — mocked). Google auth via local ADC.
 
 ---
 
 ## 14. Progress log
 
 - **2026-06-03** — Vertex `text-embedding-004` embedding function working locally
-  (`embeddings.py`, returns 768-dim vector). ✅
-- **2026-06-04** — Plan locked (safe-ship tier + EV ranking). This document created.
-  Day 1 data-layer build next.
+  (`embeddings.py`, 768-dim vector). ✅
+- **2026-06-04** — Plan locked (safe-ship tier + EV ranking). PLAN.md created.
+- **2026-06-04 (rev 2)** — **Corrected for official rules:** restored **MongoDB MCP server**
+  as the agents' mandatory data interface (eligibility req #3); pinned **Gemini 3** as the
+  model; framed build on **Google Cloud Agent Builder / ADK**; added human-in-the-loop
+  approval. Day 1 now includes standing up the MCP server.
+- **2026-06-04 (rev 3)** — **Compressed to a 4-day plan** (done ~Jun 8; Jun 9–11 buffer).
+  Vertical-slice Day 1; deployment / storefront / real SMS moved to Stretch. Node v25.6.1
+  confirmed installed (MCP server runtime). Day-1 build next.
