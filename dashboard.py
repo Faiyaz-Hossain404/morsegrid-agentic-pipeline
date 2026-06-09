@@ -55,8 +55,17 @@ USER_ID        = "dashboard_user"
 NPX            = shutil.which("npx") or ("npx.cmd" if sys.platform == "win32" else "npx")
 HERO_IDS       = {"C001", "C002", "C003"}  # Mike / Sarah / Diego — demo scenarios
 
-SEGMENT_DOTS = {"VIP": "🟣", "repeat": "🔵", "engaged": "🟢", "cold": "⚪"}
-CHANNEL_LABELS = {"email": "📧 EMAIL", "sms": "📱 SMS", "ig_dm": "📸 IG DM"}
+SEGMENT_ICONS = {
+    "VIP":     ":material/workspace_premium:",
+    "repeat":  ":material/repeat:",
+    "engaged": ":material/thumb_up:",
+    "cold":    ":material/ac_unit:",
+}
+CHANNEL_LABELS = {
+    "email": ":material/mail: EMAIL",
+    "sms":   ":material/sms: SMS",
+    "ig_dm": ":material/photo_camera: IG DM",
+}
 
 # ---------------------------------------------------------------------------
 # Activity log
@@ -74,9 +83,14 @@ def render_activity_log():
     if not log:
         st.caption("No activity yet.")
         return
-    icon_map = {"success": "✅", "error": "❌", "info": "ℹ️", "warning": "⚠️"}
+    icon_map = {
+        "success": ":material/check_circle:",
+        "error":   ":material/cancel:",
+        "info":    ":material/info:",
+        "warning": ":material/warning:",
+    }
     for entry in reversed(log[-25:]):
-        icon = icon_map.get(entry["level"], "•")
+        icon = icon_map.get(entry["level"], ":material/radio_button_unchecked:")
         st.caption(f"`{entry['ts']}` {icon} {entry['msg']}")
 
 
@@ -318,18 +332,16 @@ def render_trace(tool_trace: list):
             st.markdown(f":green[**TOOL**] &nbsp; `{entry['tool']}({args_str})`")
 
 
-
-
 def status_chip(cid: str) -> tuple:
-    """Return (emoji, label) for a lead's current state."""
     if cid in st.session_state.get("sent", {}):
         r = st.session_state.sent[cid].get("result", "")
-        return ("❌", "REJECTED") if r == "rejected" else ("✅", "SENT")
+        return (":material/cancel:", "REJECTED") if r == "rejected" \
+            else (":material/check_circle:", "SENT")
     if cid in st.session_state.get("drafts", {}):
-        return ("📝", "DRAFT READY")
+        return (":material/description:", "DRAFT READY")
     if cid in st.session_state.get("errors", {}):
-        return ("⚠️", "ERROR")
-    return ("○", "PENDING")
+        return (":material/error:", "ERROR")
+    return (":material/radio_button_unchecked:", "PENDING")
 
 
 def scoring_table_md(leads: list) -> str:
@@ -368,7 +380,7 @@ def main():
 
     # ---- Sidebar ----
     with st.sidebar:
-        st.markdown("### ⚙️ Pipeline Controls")
+        st.markdown(":material/settings: **Pipeline Controls**")
 
         demo_mode = st.toggle(
             "Demo Mode",
@@ -378,8 +390,12 @@ def main():
 
         st.divider()
 
-        # Run Planner
-        if st.button("▶ Run Planner", type="primary", use_container_width=True):
+        if st.button(
+            "Run Planner",
+            icon=":material/play_arrow:",
+            type="primary",
+            use_container_width=True,
+        ):
             with st.spinner("Fetching all customers from MongoDB & computing EV scores…"):
                 try:
                     leads = run_planner()
@@ -392,25 +408,25 @@ def main():
                     st.rerun()
                 except Exception as exc:
                     log_event("error", f"Planner failed: {exc}")
-                    st.error(f"Planner error: {exc}")
+                    st.error(f"Planner error: {exc}", icon=":material/cancel:")
 
-        # Batch nurture top-3 heroes
         has_leads = bool(st.session_state.leads)
         if st.button(
-            "⚡ Personalize Top 3",
+            "Personalize Top 3",
+            icon=":material/bolt:",
             use_container_width=True,
             disabled=not has_leads,
             help="Runs Nurturer agent on Mike, Sarah & Diego in sequence (skips those already done)",
         ):
-            leads     = st.session_state.leads
-            pending   = [
+            leads   = st.session_state.leads
+            pending = [
                 l for l in leads
                 if l["customer_id"] in HERO_IDS
                 and l["customer_id"] not in st.session_state.drafts
                 and l["customer_id"] not in st.session_state.sent
             ]
             if not pending:
-                st.info("All demo leads already have drafts.")
+                st.info("All demo leads already have drafts.", icon=":material/info:")
             else:
                 prog = st.progress(0, text="Starting batch…")
                 for i, hero in enumerate(pending):
@@ -435,17 +451,16 @@ def main():
         st.caption(f"**DB** `{DB_NAME}`")
         st.caption(f"**Demo inbox** `{os.getenv('DEMO_TO_EMAIL', '—')}`")
 
-        # Activity log
         st.divider()
-        log_col1, log_col2 = st.columns([3, 1])
-        log_col1.markdown("**Activity Log**")
-        if log_col2.button("Clear", key="clear_log"):
+        log_col1, log_col2 = st.columns([7, 4])
+        log_col1.markdown(":material/history: **Activity Log**")
+        if log_col2.button("Clear", key="clear_log", icon=":material/delete_sweep:"):
             st.session_state.activity_log = []
             st.rerun()
         render_activity_log()
 
     # ---- Header ----
-    st.markdown("## 🏍 Morsegrid Outfitters — Re-engagement Agent")
+    st.markdown("## :material/two_wheeler: Morsegrid Outfitters — Re-engagement Agent")
     st.markdown(
         "`Gemini 2.5 Flash` &nbsp;·&nbsp; `Google ADK 2.2` &nbsp;·&nbsp; "
         "`MongoDB MCP Server` &nbsp;·&nbsp; `Atlas Vector Search`"
@@ -456,7 +471,10 @@ def main():
     if not st.session_state.leads:
         left, right = st.columns([3, 2])
         with left:
-            st.info("Click **▶ Run Planner** in the sidebar to score and rank your customers.")
+            st.info(
+                "Click **Run Planner** in the sidebar to score and rank your customers.",
+                icon=":material/info:",
+            )
             st.markdown("""
 **How it works — four steps:**
 
@@ -506,7 +524,7 @@ Edit the draft. Approve or reject.
     st.divider()
 
     # ---- Full scoring table (collapsed) ----
-    with st.expander("📊 Full Lead Scoring Table — all customers", expanded=False):
+    with st.expander(":material/bar_chart: Full Lead Scoring Table — all customers", expanded=False):
         st.markdown(scoring_table_md(st.session_state.leads))
 
     # ---- Display order ----
@@ -530,25 +548,28 @@ Edit the draft. Approve or reject.
         has_error = cid in st.session_state.errors
 
         em, lbl     = status_chip(cid)
-        seg_dot     = SEGMENT_DOTS.get(lead["segment"], "⚪")
-        hero_prefix = "⭐ " if (is_hero and demo_mode) else ""
+        seg_icon    = SEGMENT_ICONS.get(lead["segment"], ":material/person:")
+        hero_prefix = ":material/star: " if (is_hero and demo_mode) else ""
 
         expander_label = (
             f"{hero_prefix}#{rank}  {lead['name']}  ·  "
-            f"{seg_dot} {lead['segment']}  ·  EV {lead['score']}  ·  {em} {lbl}"
+            f"{seg_icon} {lead['segment']}  ·  EV {lead['score']}  ·  {em} {lbl}"
         )
 
         with st.expander(expander_label, expanded=(rank <= 3 and not is_sent)):
 
-            # Sent / rejected banner at the top of the card
+            # Sent / rejected banner at top of card
             if is_sent:
                 sent_info = st.session_state.sent[cid]
                 if sent_info.get("result") != "rejected":
-                    ch = detect_channel(sent_info.get("result", ""))
-                    ch_label = CHANNEL_LABELS.get(ch, "📨 DELIVERED")
-                    st.success(f"✅ Delivered via **{ch_label}** — {sent_info.get('result', '')}")
+                    ch       = detect_channel(sent_info.get("result", ""))
+                    ch_label = CHANNEL_LABELS.get(ch, ":material/mail: DELIVERED")
+                    st.success(
+                        f"Delivered via **{ch_label}** — {sent_info.get('result', '')}",
+                        icon=":material/check_circle:",
+                    )
                 else:
-                    st.error("❌ Draft rejected — message was not sent.")
+                    st.error("Draft rejected — message was not sent.", icon=":material/cancel:")
 
             # Lead metrics
             mc1, mc2, mc3, mc4, mc5 = st.columns(5)
@@ -556,21 +577,24 @@ Edit the draft. Approve or reject.
             mc2.metric("P(convert)",      f"{lead['p_convert']:.0%}")
             mc3.metric("Days Inactive",   lead["days_inactive"])
             mc4.metric("Email Opens 30d", lead["email_opens_last_30d"])
-            mc5.metric("SMS Opt-in",      "✅" if lead.get("sms_opted_in") else "❌")
+            mc5.metric("SMS Opt-in",      "Yes" if lead.get("sms_opted_in") else "No")
 
-            # EV progress bar
+            # EV progress bar (native Streamlit component, normalized 0.0–1.0)
             ev_pct = min(lead["score"] / max_ev, 1.0) if max_ev > 0 else 0.0
             st.progress(ev_pct, text=f"EV Score: **{lead['score']}** / {max_ev} top score")
 
             st.caption(f"**Why this lead:** {lead['rationale']}")
 
             if lead.get("behavior_summary"):
-                st.info(f"🧠 **Behavior signal:** {lead['behavior_summary']}")
+                st.info(
+                    f"**Behavior signal:** {lead['behavior_summary']}",
+                    icon=":material/psychology:",
+                )
 
             st.markdown(
-                f"📧 `{lead['email']}`  &nbsp;·&nbsp;  "
-                f"📱 `{lead.get('phone', '—')}`  &nbsp;·&nbsp;  "
-                f"📸 `{lead.get('ig_handle', '—')}`"
+                f":material/mail: `{lead['email']}`  &nbsp;·&nbsp;  "
+                f":material/smartphone: `{lead.get('phone', '—')}`  &nbsp;·&nbsp;  "
+                f":material/photo_camera: `{lead.get('ig_handle', '—')}`"
             )
 
             st.divider()
@@ -579,16 +603,19 @@ Edit the draft. Approve or reject.
             if not has_draft and not is_sent:
                 if has_error:
                     st.warning(
-                        f"⚠️ Last attempt failed: `{st.session_state.errors[cid][:150]}`"
+                        f"Last attempt failed: `{st.session_state.errors[cid][:150]}`",
+                        icon=":material/warning:",
                     )
                     do_nurture = st.button(
-                        "↺ Retry Nurturer",
+                        "Retry Nurturer",
+                        icon=":material/refresh:",
                         key=f"nurture_{cid}",
                         type="secondary",
                     )
                 else:
                     do_nurture = st.button(
-                        "🤖 Personalize Message",
+                        "Personalize Message",
+                        icon=":material/smart_toy:",
                         key=f"nurture_{cid}",
                         type="secondary",
                         help="Runs Nurturer agent — MCP behavior fetch + Atlas Vector Search",
@@ -596,12 +623,15 @@ Edit the draft. Approve or reject.
 
                 if do_nurture:
                     with st.status(
-                        f"Nurturer working on {lead['name']}…",
+                        f":material/sync: Nurturer working on {lead['name']}…",
                         expanded=True,
                     ) as nstatus:
-                        st.write(f"📂 Fetching {lead['name']}'s behavior history from MongoDB via MCP `find`…")
-                        st.write("🔍 Running Atlas Vector Search for matching products…")
-                        st.write("✍️ Drafting personalized re-engagement email (Gemini 2.5 Flash)…")
+                        st.write(
+                            f":material/folder_open: Fetching {lead['name']}'s behavior "
+                            f"history from MongoDB via MCP `find`…"
+                        )
+                        st.write(":material/search: Running Atlas Vector Search for matching products…")
+                        st.write(":material/edit_note: Drafting personalized re-engagement email (Gemini 2.5 Flash)…")
                         try:
                             draft, tool_trace = run_nurturer(lead)
                             st.session_state.drafts[cid] = {
@@ -613,7 +643,7 @@ Edit the draft. Approve or reject.
                             mcp_n = sum(1 for t in tool_trace if t.get("is_mcp"))
                             log_event("success", f"Draft ready: {lead['name']} ({mcp_n} MCP calls)")
                             nstatus.update(
-                                label=f"✅ Draft ready for {lead['name']} — {mcp_n} MCP calls made",
+                                label=f":material/check_circle: Draft ready for {lead['name']} — {mcp_n} MCP calls",
                                 state="complete",
                                 expanded=False,
                             )
@@ -623,11 +653,11 @@ Edit the draft. Approve or reject.
                             st.session_state.errors[cid] = str(exc)
                             log_event("error", f"Nurturer failed for {lead['name']}: {exc}")
                             nstatus.update(
-                                label=f"❌ Nurturer error — {lead['name']}",
+                                label=f":material/cancel: Nurturer error — {lead['name']}",
                                 state="error",
                                 expanded=True,
                             )
-                            st.error(f"**Error:** {exc}")
+                            st.error(f"**Error:** {exc}", icon=":material/cancel:")
                             st.rerun()
 
             # ---- Draft view ----
@@ -639,9 +669,8 @@ Edit the draft. Approve or reject.
                 mcp_count  = sum(1 for t in tool_trace if t.get("is_mcp"))
                 tool_count = len(tool_trace) - mcp_count
 
-                # Agent reasoning trace
                 with st.expander(
-                    f"🔍 Agent Reasoning Trace — {len(tool_trace)} tool calls "
+                    f":material/account_tree: Agent Reasoning Trace — {len(tool_trace)} tool calls "
                     f"({mcp_count} MCP · {tool_count} custom)",
                     expanded=False,
                 ):
@@ -649,14 +678,13 @@ Edit the draft. Approve or reject.
                     recs = draft.get("recommended_product_ids", [])
                     if recs:
                         st.caption(
-                            f"🛒 Vector search surfaced: **{', '.join(recs)}**"
+                            f":material/shopping_cart: Vector search surfaced: **{', '.join(recs)}**"
                         )
                     st.caption(
-                        f"MCP calls are :blue[**blue**] (MongoDB operations). "
-                        f"Custom tools are :green[**green**]."
+                        "MCP calls are :blue[**blue**] (MongoDB operations). "
+                        "Custom tools are :green[**green**]."
                     )
 
-                # Draft layout — body left, metadata right
                 body_col, meta_col = st.columns([3, 1])
                 with body_col:
                     st.markdown(f"**Subject:** {draft.get('subject', '—')}")
@@ -674,7 +702,7 @@ Edit the draft. Approve or reject.
                     st.markdown("**Predicted channel**")
                     opens = lead.get("email_opens_last_30d", 0)
                     sms   = lead.get("sms_opted_in", False)
-                    pred  = "📱 SMS" if (sms and opens < 2) else "📧 Email"
+                    pred  = ":material/sms: SMS" if (sms and opens < 2) else ":material/mail: Email"
                     st.markdown(pred)
 
                 # ---- Approve / Reject ----
@@ -683,17 +711,18 @@ Edit the draft. Approve or reject.
 
                     with b_approve:
                         if st.button(
-                            "✅ Approve & Send",
+                            "Approve & Send",
+                            icon=":material/send:",
                             key=f"approve_{cid}",
                             type="primary",
                         ):
                             with st.status(
-                                f"Sender delivering to {lead['name']}…",
+                                f":material/sync: Sender delivering to {lead['name']}…",
                                 expanded=True,
                             ) as sstatus:
-                                st.write("📡 Calling `pick_channel` — selecting best channel…")
-                                st.write("📤 Sending message (Resend API / mock)…")
-                                st.write("💾 Logging delivery to MongoDB via MCP `insert-many`…")
+                                st.write(":material/call_split: Calling `pick_channel` — selecting best channel…")
+                                st.write(":material/upload: Sending message (Resend API / mock)…")
+                                st.write(":material/save: Logging delivery to MongoDB via MCP `insert-many`…")
                                 try:
                                     edited_draft = {
                                         **draft,
@@ -707,7 +736,7 @@ Edit the draft. Approve or reject.
                                         "tool_trace": sender_trace,
                                     }
                                     ch       = detect_channel(result)
-                                    ch_label = CHANNEL_LABELS.get(ch, "📨 DELIVERED")
+                                    ch_label = CHANNEL_LABELS.get(ch, ":material/mail: DELIVERED")
                                     smcp     = sum(1 for t in sender_trace if t.get("is_mcp"))
                                     log_event(
                                         "success",
@@ -715,7 +744,7 @@ Edit the draft. Approve or reject.
                                     )
                                     sstatus.update(
                                         label=(
-                                            f"✅ Delivered to {lead['name']} — "
+                                            f":material/check_circle: Delivered to {lead['name']} — "
                                             f"{ch_label} · {smcp} MCP calls"
                                         ),
                                         state="complete",
@@ -726,14 +755,18 @@ Edit the draft. Approve or reject.
                                 except Exception as exc:
                                     log_event("error", f"Sender failed for {lead['name']}: {exc}")
                                     sstatus.update(
-                                        label=f"❌ Sender error — {lead['name']}",
+                                        label=f":material/cancel: Sender error — {lead['name']}",
                                         state="error",
                                         expanded=True,
                                     )
-                                    st.error(f"**Sender error:** {exc}")
+                                    st.error(f"**Sender error:** {exc}", icon=":material/cancel:")
 
                     with b_reject:
-                        if st.button("❌ Reject", key=f"reject_{cid}"):
+                        if st.button(
+                            "Reject",
+                            icon=":material/block:",
+                            key=f"reject_{cid}",
+                        ):
                             st.session_state.sent[cid] = {
                                 "result": "rejected", "tool_trace": [],
                             }
@@ -748,7 +781,7 @@ Edit the draft. Approve or reject.
                     if sender_trace and sent_info.get("result") != "rejected":
                         smcp = sum(1 for t in sender_trace if t.get("is_mcp"))
                         with st.expander(
-                            f"📡 Sender Trace — {len(sender_trace)} tool calls "
+                            f":material/cell_tower: Sender Trace — {len(sender_trace)} tool calls "
                             f"({smcp} MCP inc. `insert-many` log write)",
                             expanded=False,
                         ):
