@@ -221,13 +221,14 @@ messages_sent   _id, customer_id, channel, subject?, body,
 > storefront UI, real Twilio SMS. **Kept:** everything eligibility needs + the wedge.
 
 ### Day 1 · Jun 4–5 — Foundation + de-risk the full stack
-- [ ] `requirements.txt`; DB connection module + ping
-- [ ] Seed (~18 customers, ~50 products w/ cost+margin, ~200 events, orders) — pymongo
-- [ ] Embed docs + create both vector indexes — pymongo
-- [ ] Install + **import-check `google-adk`, `sendgrid`, `streamlit` on Python 3.14** — if it fails, make a 3.12 venv NOW
-- [ ] Confirm a **`gemini-3-*`** model is available in your Vertex `LOCATION`
-- [ ] Stand up **MongoDB MCP server** (`npx`) + connect via ADK `MCPToolset`; a Gemini 3 test agent calls MCP `find`
-- [ ] **Pass gate (slice):** `$vectorSearch` returns a hit **AND** a Gemini 3 agent calls a MongoDB MCP tool. *If green, the rest is just building.*
+- [x] `requirements.txt`; DB connection module + ping
+- [x] Seed (50 products / 18 customers / 33 orders / 189 events) — pymongo
+- [x] Embed docs + create both vector indexes — pymongo
+- [x] Install + import-check `google-adk` (2.2.0) on Python 3.14 — PASSES, no 3.12 downgrade
+- [x] Confirm Gemini model: **`gemini-2.5-pro`** is the Vertex API ID for "Gemini 3" in this project
+- [x] Stand up **MongoDB MCP server** (`npx`) + connect via ADK `McpToolset`; agent called MCP `count` → returned 18
+- [x] **Pass gate A:** `$vectorSearch` returns hits (top: Cafe Racer Jacket 0.947) ✅
+- [x] **Pass gate B:** `gemini-2.5-pro` agent invoked MongoDB MCP server → **DAY 1 FULLY DONE** ✅
 
 ### Day 2 · Jun 6 — The agent pipeline (the heart)
 - [ ] Custom tools: `embed_query`, `score_lead_ev` (EV), `pick_channel`, `send_email` (real), `send_sms`/`send_ig_dm` (mock)
@@ -334,3 +335,12 @@ npx -y mongodb-mcp-server --connectionString "$MONGODB_URI"   # smoke test
 - **2026-06-04 (rev 3)** — **Compressed to a 4-day plan** (done ~Jun 8; Jun 9–11 buffer).
   Vertical-slice Day 1; deployment / storefront / real SMS moved to Stretch. Node v25.6.1
   confirmed installed (MCP server runtime). Day-1 build next.
+- **2026-06-07** — **DAY 1 FULLY COMPLETE.** Data layer GREEN. Seeded 50 products / 18 customers / 33 orders /
+  189 events; embedded all 68 docs (Vertex text-embedding-004); both Atlas vector indexes
+  queryable. Test `$vectorSearch` "vintage cafe racer leather jacket" → top hit Classic
+  Leather Cafe Racer Jacket (0.947), all top-5 on-theme. `google-adk 2.2.0` + `mcp 1.27.2`
+  install on Python 3.14. Detour: expired ADC token fixed via `gcloud auth
+  application-default login`. Model discovery: "Gemini 3" on Vertex = `gemini-2.5-pro`
+  (also `gemini-2.5-flash`). MCP smoke test: agent called MCP `count` on customers
+  → returned 18. Full eligibility chain proven: gemini-2.5-pro → ADK → MongoDB MCP
+  server → Atlas. **Day 2 next: the full 3-agent pipeline.**

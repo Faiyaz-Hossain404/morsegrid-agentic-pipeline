@@ -1,0 +1,759 @@
+"""
+Morsegrid Outfitters — Re-engagement Agent Dashboard
+
+Streamlit UI: ranked lead queue → Nurturer drafts → human approves → Sender delivers.
+Agents use the MongoDB MCP server for all DB ops (eligibility req #3).
+
+Run:
+    venv/Scripts/streamlit.exe run dashboard.py
+"""
+import os
+import sys
+import asyncio
+import json
+import re
+import shutil
+import time
+from datetime import datetime, timezone
+
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _ROOT)
+
+from dotenv import load_dotenv
+load_dotenv(os.path.join(_ROOT, ".env"))
+
+os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "TRUE")
+if os.getenv("PROJECT_ID"):
+    os.environ.setdefault("GOOGLE_CLOUD_PROJECT", os.getenv("PROJECT_ID"))
+if os.getenv("LOCATION"):
+    os.environ.setdefault("GOOGLE_CLOUD_LOCATION", os.getenv("LOCATION"))
+
+import streamlit as st
+
+from google.adk.agents import LlmAgent
+from google.adk.runners import InMemoryRunner
+from google.adk.tools.mcp_tool import McpToolset, StdioConnectionParams
+from mcp import StdioServerParameters
+from google.genai import types
+
+from db.mongo import get_db_client
+from tools.lead_scorer import score_lead_ev
+from tools.product_search import find_similar_products
+from tools.channel import pick_channel
+from tools.email_sender import send_email_resend
+from tools.mock_channels import send_sms_mock, send_ig_dm_mock
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+DB_NAME        = "morsegrid_outfitters"
+NURTURER_MODEL = os.getenv("NURTURER_MODEL", "gemini-2.5-flash")
+SENDER_MODEL   = os.getenv("SENDER_MODEL",   "gemini-2.5-flash")
+APP            = "morsegrid_dashboard"
+USER_ID        = "dashboard_user"
+NPX            = shutil.which("npx") or ("npx.cmd" if sys.platform == "win32" else "npx")
+HERO_IDS       = {"C001", "C002", "C003"}  # Mike / Sarah / Diego — demo scenarios
+
+SEGMENT_DOTS = {"VIP": "🟣", "repeat": "🔵", "engaged": "🟢", "cold": "⚪"}
+CHANNEL_LABELS = {"email": "📧 EMAIL", "sms": "📱 SMS", "ig_dm": "📸 IG DM"}
+
+# ---------------------------------------------------------------------------
+# Activity log
+# ---------------------------------------------------------------------------
+
+def log_event(level: str, message: str):
+    if "activity_log" not in st.session_state:
+        st.session_state.activity_log = []
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    st.session_state.activity_log.append({"ts": ts, "level": level, "msg": message})
+
+
+def render_activity_log():
+    log = st.session_state.get("activity_log", [])
+    if not log:
+        st.caption("No activity yet.")
+        return
+    icon_map = {"success": "✅", "error": "❌", "info": "ℹ️", "warning": "⚠️"}
+    for entry in reversed(log[-25:]):
+        icon = icon_map.get(entry["level"], "•")
+        st.caption(f"`{entry['ts']}` {icon} {entry['msg']}")
+
+
+# ---------------------------------------------------------------------------
+# Async infra
+# ---------------------------------------------------------------------------
+
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def build_toolset() -> McpToolset:
+    uri = os.getenv("MONGODB_URI")
+    if not uri:
+        raise RuntimeError("MONGODB_URI missing from .env")
+    return McpToolset(
+        connection_params=StdioConnectionParams(
+            server_params=StdioServerParameters(
+                command=NPX,
+                args=["-y", "mongodb-mcp-server"],
+                env={**os.environ, "MDB_MCP_CONNECTION_STRING": uri},
+            ),
+            timeout=120,
+        ),
+    )
+
+
+async def agent_turn(runner: InMemoryRunner, session_id: str, text: str):
+    msg = types.Content(role="user", parts=[types.Part(text=text)])
+    tool_trace, final_parts = [], []
+
+    async for event in runner.run_async(user_id=USER_ID, session_id=session_id, new_message=msg):
+        content = getattr(event, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            fc = getattr(part, "function_call", None)
+            if fc:
+                args = dict(fc.args) if getattr(fc, "args", None) else {}
+                tool_trace.append({
+                    "tool": fc.name,
+                    "args": {k: v for k, v in list(args.items())[:4]},
+                    "is_mcp": fc.name in {
+                        "find", "aggregate", "count", "insert-many",
+                        "update-many", "delete-many", "list-collections",
+                    },
+                })
+            txt = getattr(part, "text", None)
+            if txt and event.is_final_response():
+                final_parts.append(txt)
+
+    return "".join(final_parts), tool_trace
+
+
+def extract_json(text: str):
+    text = text.strip()
+    m = re.search(r"```(?:json)?\s*([\[\{].*?[\]\}])\s*```", text, re.DOTALL)
+    if m:
+        return json.loads(m.group(1))
+    m = re.search(r"([\[\{].*[\]\}])", text, re.DOTALL)
+    if m:
+        return json.loads(m.group(1))
+    raise ValueError(f"No JSON found in agent output:\n{text[:400]}")
+
+
+def detect_channel(result_text: str) -> str:
+    t = result_text.lower()
+    for ch in ("ig_dm", "sms", "email"):
+        if ch.replace("_", " ") in t or ch in t:
+            return ch
+    return "email"
+
+
+# ---------------------------------------------------------------------------
+# Planner — pure Python (no LLM)
+# ---------------------------------------------------------------------------
+
+def run_planner() -> list:
+    client = get_db_client()
+    customers = list(client[DB_NAME].customers.find({}))
+    now = datetime.now(timezone.utc)
+    scored = []
+
+    for c in customers:
+        raw_ts = c.get("last_active_at", "")
+        try:
+            if isinstance(raw_ts, datetime):
+                last_active = raw_ts.replace(tzinfo=timezone.utc) if raw_ts.tzinfo is None else raw_ts
+            elif isinstance(raw_ts, (int, float)):
+                last_active = datetime.fromtimestamp(raw_ts / 1000, tz=timezone.utc)
+            else:
+                last_active = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+        except Exception:
+            last_active = now
+
+        days_inactive = max((now - last_active).days, 0)
+        total_orders  = int(c.get("total_orders", 0))
+        total_spend   = float(c.get("total_spend", 0.0))
+        avg_order_val = (total_spend / total_orders) if total_orders > 0 else 250.0
+        eng         = c.get("engagement") or {}
+        last5       = eng.get("last5_opens") or []
+        email_opens = sum(1 for v in last5 if v)
+        sms_optin   = bool(eng.get("sms_optin", False))
+
+        ev = score_lead_ev(
+            customer_id=c["customer_id"],
+            segment=c.get("segment", "cold"),
+            days_inactive=days_inactive,
+            total_orders=total_orders,
+            avg_order_value=avg_order_val,
+            email_opens_last_30d=email_opens,
+            sms_opted_in=sms_optin,
+        )
+        scored.append({
+            **c,
+            "score":                ev["score"],
+            "rationale":            ev["rationale"],
+            "p_convert":            ev["p_convert"],
+            "days_inactive":        days_inactive,
+            "email_opens_last_30d": email_opens,
+            "sms_opted_in":         sms_optin,
+        })
+
+    return sorted(scored, key=lambda x: x["score"], reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# Nurturer — ADK agent + MCP
+# ---------------------------------------------------------------------------
+
+async def _nurturer_async(lead: dict):
+    toolset = build_toolset()
+    try:
+        agent = LlmAgent(
+            name="nurturer",
+            model=NURTURER_MODEL,
+            instruction=f"""You are the Nurturer for Morsegrid Outfitters' re-engagement pipeline.
+
+For the customer you receive:
+1. Call MongoDB find (database='{DB_NAME}', collection='behavior_events') filtered by
+   customer_id, limit 15, to see their recent searches, views, and orders.
+2. Call find_similar_products with a query that captures their specific interests —
+   use their search queries, product categories viewed, and behavior_summary.
+3. Draft a warm, personal re-engagement email (NOT a mass-marketing blast):
+   - Reference the specific reason we are reaching out (item back in stock, new arrival
+     matching their search, latent want now available, etc.).
+   - Name 1-2 recommended products with prices.
+   - Keep body under 200 words. Sound like a real person at the store.
+4. Return ONLY a valid JSON object:
+   {{"subject": "...", "body": "...", "recommended_product_ids": ["P001", ...]}}
+
+Output ONLY the JSON. No surrounding text.""",
+            tools=[toolset, find_similar_products],
+        )
+        sid = f"dash-nur-{lead['customer_id']}-{datetime.now(timezone.utc).strftime('%H%M%S')}"
+        runner = InMemoryRunner(agent=agent, app_name=APP)
+        await runner.session_service.create_session(app_name=APP, user_id=USER_ID, session_id=sid)
+
+        prompt = (
+            f"Customer ID: {lead['customer_id']} | Name: {lead['name']} | "
+            f"Segment: {lead['segment']} | Days inactive: {lead['days_inactive']} | "
+            f"Behavior: {lead.get('behavior_summary', 'N/A')}. "
+            f"Fetch their events, find matching products, draft the re-engagement message."
+        )
+        output, tool_trace = await agent_turn(runner, sid, prompt)
+        return extract_json(output), tool_trace
+    finally:
+        await toolset.close()
+
+
+def run_nurturer(lead: dict):
+    return run_async(_nurturer_async(lead))
+
+
+# ---------------------------------------------------------------------------
+# Sender — ADK agent + MCP
+# ---------------------------------------------------------------------------
+
+async def _sender_async(lead: dict, draft: dict):
+    toolset = build_toolset()
+    try:
+        agent = LlmAgent(
+            name="sender",
+            model=SENDER_MODEL,
+            instruction=f"""You are the Sender for Morsegrid Outfitters' re-engagement pipeline.
+
+Complete ALL 4 steps for the customer you receive:
+1. Call pick_channel(segment, email_opens_last_30d, sms_opted_in) to choose the channel.
+2. Send via the right tool:
+   - "email"  -> send_email_resend(to_email, subject, body, customer_id)
+   - "sms"    -> send_sms_mock(to_phone, body, customer_id)
+   - "ig_dm"  -> send_ig_dm_mock(ig_handle, body, customer_id)
+3. Call MongoDB insert-many (database='{DB_NAME}', collection='messages_sent') to log.
+   Document fields: customer_id, name, channel, subject, sent_at (ISO 8601 UTC now), status.
+4. Reply with a one-line confirmation: "Sent to [Name] via [channel] — [status]." """,
+            tools=[toolset, pick_channel, send_email_resend, send_sms_mock, send_ig_dm_mock],
+        )
+        sid = f"dash-snd-{lead['customer_id']}-{datetime.now(timezone.utc).strftime('%H%M%S')}"
+        runner = InMemoryRunner(agent=agent, app_name=APP)
+        await runner.session_service.create_session(app_name=APP, user_id=USER_ID, session_id=sid)
+
+        prompt = (
+            f"Customer ID: {lead['customer_id']} | Name: {lead['name']} | "
+            f"Email: {lead['email']} | Phone: {lead.get('phone', 'N/A')} | "
+            f"IG: {lead.get('ig_handle', 'N/A')} | Segment: {lead['segment']} | "
+            f"SMS opted in: {lead.get('sms_opted_in', False)} | "
+            f"Email opens last 30d: {lead.get('email_opens_last_30d', 0)}. "
+            f"Subject: {draft.get('subject', '')} | Body: {draft.get('body', '')} "
+            f"Send and log to MongoDB now."
+        )
+        output, tool_trace = await agent_turn(runner, sid, prompt)
+        return output.strip(), tool_trace
+    finally:
+        await toolset.close()
+
+
+def run_sender(lead: dict, draft: dict):
+    return run_async(_sender_async(lead, draft))
+
+
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
+
+def render_trace(tool_trace: list):
+    if not tool_trace:
+        st.caption("No tool calls recorded.")
+        return
+    for entry in tool_trace:
+        args_str = ", ".join(
+            f"{k}={repr(v)[:60]}" for k, v in entry.get("args", {}).items()
+        )
+        if entry.get("is_mcp"):
+            st.markdown(f":blue[**MCP**] &nbsp; `{entry['tool']}({args_str})`")
+        else:
+            st.markdown(f":green[**TOOL**] &nbsp; `{entry['tool']}({args_str})`")
+
+
+
+
+def status_chip(cid: str) -> tuple:
+    """Return (emoji, label) for a lead's current state."""
+    if cid in st.session_state.get("sent", {}):
+        r = st.session_state.sent[cid].get("result", "")
+        return ("❌", "REJECTED") if r == "rejected" else ("✅", "SENT")
+    if cid in st.session_state.get("drafts", {}):
+        return ("📝", "DRAFT READY")
+    if cid in st.session_state.get("errors", {}):
+        return ("⚠️", "ERROR")
+    return ("○", "PENDING")
+
+
+def scoring_table_md(leads: list) -> str:
+    rows = [
+        "| # | Name | Segment | EV Score | P(conv) | Days | Email Opens | Status |",
+        "|---|------|---------|----------|---------|------|-------------|--------|",
+    ]
+    for i, l in enumerate(leads, 1):
+        em, lbl = status_chip(l["customer_id"])
+        rows.append(
+            f"| {i} | {l['name']} | {l['segment']} | **{l['score']}** | "
+            f"{l['p_convert']:.0%} | {l['days_inactive']} | "
+            f"{l['email_opens_last_30d']} | {em} {lbl} |"
+        )
+    return "\n".join(rows)
+
+
+# ---------------------------------------------------------------------------
+# Main dashboard
+# ---------------------------------------------------------------------------
+
+def main():
+    st.set_page_config(
+        page_title="Morsegrid Outfitters — Re-engagement",
+        page_icon="🏍",
+        layout="wide",
+    )
+
+    # Session state init
+    for key, default in [
+        ("leads", []), ("drafts", {}), ("sent", {}),
+        ("errors", {}), ("activity_log", []),
+    ]:
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+    # ---- Sidebar ----
+    with st.sidebar:
+        st.markdown("### ⚙️ Pipeline Controls")
+
+        demo_mode = st.toggle(
+            "Demo Mode",
+            value=True,
+            help="Pins Mike / Sarah / Diego (C001–C003) to top of queue",
+        )
+
+        st.divider()
+
+        # Run Planner
+        if st.button("▶ Run Planner", type="primary", use_container_width=True):
+            with st.spinner("Fetching all customers from MongoDB & computing EV scores…"):
+                try:
+                    leads = run_planner()
+                    st.session_state.leads  = leads
+                    st.session_state.drafts = {}
+                    st.session_state.sent   = {}
+                    st.session_state.errors = {}
+                    log_event("success", f"Planner scored {len(leads)} customers")
+                    st.toast(f"Ranked {len(leads)} customers by EV score", icon="✅")
+                    st.rerun()
+                except Exception as exc:
+                    log_event("error", f"Planner failed: {exc}")
+                    st.error(f"Planner error: {exc}")
+
+        # Batch nurture top-3 heroes
+        has_leads = bool(st.session_state.leads)
+        if st.button(
+            "⚡ Personalize Top 3",
+            use_container_width=True,
+            disabled=not has_leads,
+            help="Runs Nurturer agent on Mike, Sarah & Diego in sequence (skips those already done)",
+        ):
+            leads     = st.session_state.leads
+            pending   = [
+                l for l in leads
+                if l["customer_id"] in HERO_IDS
+                and l["customer_id"] not in st.session_state.drafts
+                and l["customer_id"] not in st.session_state.sent
+            ]
+            if not pending:
+                st.info("All demo leads already have drafts.")
+            else:
+                prog = st.progress(0, text="Starting batch…")
+                for i, hero in enumerate(pending):
+                    prog.progress(i / len(pending), text=f"Nurturing {hero['name']}…")
+                    try:
+                        draft, trace = run_nurturer(hero)
+                        st.session_state.drafts[hero["customer_id"]] = {
+                            "draft": draft, "tool_trace": trace,
+                        }
+                        log_event("success", f"Draft ready: {hero['name']}")
+                        st.toast(f"Draft ready: {hero['name']}")
+                    except Exception as exc:
+                        st.session_state.errors[hero["customer_id"]] = str(exc)
+                        log_event("error", f"Nurturer error for {hero['name']}: {exc}")
+                        st.toast(f"Error on {hero['name']}", icon="🚨")
+                prog.progress(1.0, text="Batch complete!")
+                time.sleep(0.5)
+                st.rerun()
+
+        st.divider()
+        st.caption(f"**Model** `{NURTURER_MODEL}`")
+        st.caption(f"**DB** `{DB_NAME}`")
+        st.caption(f"**Demo inbox** `{os.getenv('DEMO_TO_EMAIL', '—')}`")
+
+        # Activity log
+        st.divider()
+        log_col1, log_col2 = st.columns([3, 1])
+        log_col1.markdown("**Activity Log**")
+        if log_col2.button("Clear", key="clear_log"):
+            st.session_state.activity_log = []
+            st.rerun()
+        render_activity_log()
+
+    # ---- Header ----
+    st.markdown("## 🏍 Morsegrid Outfitters — Re-engagement Agent")
+    st.markdown(
+        "`Gemini 2.5 Flash` &nbsp;·&nbsp; `Google ADK 2.2` &nbsp;·&nbsp; "
+        "`MongoDB MCP Server` &nbsp;·&nbsp; `Atlas Vector Search`"
+    )
+    st.divider()
+
+    # ---- Empty state ----
+    if not st.session_state.leads:
+        left, right = st.columns([3, 2])
+        with left:
+            st.info("Click **▶ Run Planner** in the sidebar to score and rank your customers.")
+            st.markdown("""
+**How it works — four steps:**
+
+**1 · Planner** — fetches all customers from MongoDB, scores each with:
+> `EV = P(convert) × avg_margin × e^(−days_inactive / 60)`
+
+**2 · Nurturer** *(Gemini 2.5 Flash + ADK + MongoDB MCP)* — reads the customer's
+behavior history via MCP `find`, runs Atlas Vector Search for matching products,
+and drafts a personalized re-engagement message.
+
+**3 · You review** — inspect every tool call in the Agent Reasoning Trace.
+Edit the draft. Approve or reject.
+
+**4 · Sender** *(Gemini 2.5 Flash + ADK + MongoDB MCP)* — picks the best channel
+(email / SMS / IG DM), delivers the message, and logs delivery to MongoDB via MCP `insert-many`.
+            """)
+        with right:
+            st.markdown("#### Stack")
+            st.markdown("""
+| Component | Technology |
+|-----------|-----------|
+| Orchestration | Google ADK 2.2 |
+| LLM | Gemini 2.5 Flash |
+| DB Operations | MongoDB MCP Server |
+| Vector Search | Atlas + text-embedding-004 |
+| Email Delivery | Resend API |
+| Lead Scoring | Pure Python EV formula |
+            """)
+        return
+
+    # ---- Metrics ----
+    sent_count = sum(
+        1 for v in st.session_state.sent.values()
+        if v.get("result") != "rejected"
+    )
+    rejected_count = sum(
+        1 for v in st.session_state.sent.values()
+        if v.get("result") == "rejected"
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Customers Scored", len(st.session_state.leads))
+    c2.metric("Drafts Ready",     len(st.session_state.drafts))
+    c3.metric("Messages Sent",    sent_count)
+    c4.metric("Rejected",         rejected_count)
+
+    st.divider()
+
+    # ---- Full scoring table (collapsed) ----
+    with st.expander("📊 Full Lead Scoring Table — all customers", expanded=False):
+        st.markdown(scoring_table_md(st.session_state.leads))
+
+    # ---- Display order ----
+    leads = st.session_state.leads
+    if demo_mode:
+        heroes  = [l for l in leads if l["customer_id"] in HERO_IDS]
+        others  = [l for l in leads if l["customer_id"] not in HERO_IDS]
+        display = heroes + others
+    else:
+        display = leads
+
+    max_ev = max((l["score"] for l in display), default=1)
+
+    st.subheader("Re-engagement Queue")
+
+    for rank, lead in enumerate(display[:8], 1):
+        cid       = lead["customer_id"]
+        is_hero   = cid in HERO_IDS
+        has_draft = cid in st.session_state.drafts
+        is_sent   = cid in st.session_state.sent
+        has_error = cid in st.session_state.errors
+
+        em, lbl     = status_chip(cid)
+        seg_dot     = SEGMENT_DOTS.get(lead["segment"], "⚪")
+        hero_prefix = "⭐ " if (is_hero and demo_mode) else ""
+
+        expander_label = (
+            f"{hero_prefix}#{rank}  {lead['name']}  ·  "
+            f"{seg_dot} {lead['segment']}  ·  EV {lead['score']}  ·  {em} {lbl}"
+        )
+
+        with st.expander(expander_label, expanded=(rank <= 3 and not is_sent)):
+
+            # Sent / rejected banner at the top of the card
+            if is_sent:
+                sent_info = st.session_state.sent[cid]
+                if sent_info.get("result") != "rejected":
+                    ch = detect_channel(sent_info.get("result", ""))
+                    ch_label = CHANNEL_LABELS.get(ch, "📨 DELIVERED")
+                    st.success(f"✅ Delivered via **{ch_label}** — {sent_info.get('result', '')}")
+                else:
+                    st.error("❌ Draft rejected — message was not sent.")
+
+            # Lead metrics
+            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+            mc1.metric("EV Score",        lead["score"])
+            mc2.metric("P(convert)",      f"{lead['p_convert']:.0%}")
+            mc3.metric("Days Inactive",   lead["days_inactive"])
+            mc4.metric("Email Opens 30d", lead["email_opens_last_30d"])
+            mc5.metric("SMS Opt-in",      "✅" if lead.get("sms_opted_in") else "❌")
+
+            # EV progress bar
+            ev_pct = min(lead["score"] / max_ev, 1.0) if max_ev > 0 else 0.0
+            st.progress(ev_pct, text=f"EV Score: **{lead['score']}** / {max_ev} top score")
+
+            st.caption(f"**Why this lead:** {lead['rationale']}")
+
+            if lead.get("behavior_summary"):
+                st.info(f"🧠 **Behavior signal:** {lead['behavior_summary']}")
+
+            st.markdown(
+                f"📧 `{lead['email']}`  &nbsp;·&nbsp;  "
+                f"📱 `{lead.get('phone', '—')}`  &nbsp;·&nbsp;  "
+                f"📸 `{lead.get('ig_handle', '—')}`"
+            )
+
+            st.divider()
+
+            # ---- Personalize button ----
+            if not has_draft and not is_sent:
+                if has_error:
+                    st.warning(
+                        f"⚠️ Last attempt failed: `{st.session_state.errors[cid][:150]}`"
+                    )
+                    do_nurture = st.button(
+                        "↺ Retry Nurturer",
+                        key=f"nurture_{cid}",
+                        type="secondary",
+                    )
+                else:
+                    do_nurture = st.button(
+                        "🤖 Personalize Message",
+                        key=f"nurture_{cid}",
+                        type="secondary",
+                        help="Runs Nurturer agent — MCP behavior fetch + Atlas Vector Search",
+                    )
+
+                if do_nurture:
+                    with st.status(
+                        f"Nurturer working on {lead['name']}…",
+                        expanded=True,
+                    ) as nstatus:
+                        st.write(f"📂 Fetching {lead['name']}'s behavior history from MongoDB via MCP `find`…")
+                        st.write("🔍 Running Atlas Vector Search for matching products…")
+                        st.write("✍️ Drafting personalized re-engagement email (Gemini 2.5 Flash)…")
+                        try:
+                            draft, tool_trace = run_nurturer(lead)
+                            st.session_state.drafts[cid] = {
+                                "draft": draft,
+                                "tool_trace": tool_trace,
+                            }
+                            if cid in st.session_state.errors:
+                                del st.session_state.errors[cid]
+                            mcp_n = sum(1 for t in tool_trace if t.get("is_mcp"))
+                            log_event("success", f"Draft ready: {lead['name']} ({mcp_n} MCP calls)")
+                            nstatus.update(
+                                label=f"✅ Draft ready for {lead['name']} — {mcp_n} MCP calls made",
+                                state="complete",
+                                expanded=False,
+                            )
+                            st.toast(f"Draft ready: {lead['name']}")
+                            st.rerun()
+                        except Exception as exc:
+                            st.session_state.errors[cid] = str(exc)
+                            log_event("error", f"Nurturer failed for {lead['name']}: {exc}")
+                            nstatus.update(
+                                label=f"❌ Nurturer error — {lead['name']}",
+                                state="error",
+                                expanded=True,
+                            )
+                            st.error(f"**Error:** {exc}")
+                            st.rerun()
+
+            # ---- Draft view ----
+            if has_draft:
+                d          = st.session_state.drafts[cid]
+                draft      = d["draft"]
+                tool_trace = d.get("tool_trace", [])
+
+                mcp_count  = sum(1 for t in tool_trace if t.get("is_mcp"))
+                tool_count = len(tool_trace) - mcp_count
+
+                # Agent reasoning trace
+                with st.expander(
+                    f"🔍 Agent Reasoning Trace — {len(tool_trace)} tool calls "
+                    f"({mcp_count} MCP · {tool_count} custom)",
+                    expanded=False,
+                ):
+                    render_trace(tool_trace)
+                    recs = draft.get("recommended_product_ids", [])
+                    if recs:
+                        st.caption(
+                            f"🛒 Vector search surfaced: **{', '.join(recs)}**"
+                        )
+                    st.caption(
+                        f"MCP calls are :blue[**blue**] (MongoDB operations). "
+                        f"Custom tools are :green[**green**]."
+                    )
+
+                # Draft layout — body left, metadata right
+                body_col, meta_col = st.columns([3, 1])
+                with body_col:
+                    st.markdown(f"**Subject:** {draft.get('subject', '—')}")
+                    st.text_area(
+                        "Message body (editable before approval)",
+                        value=draft.get("body", ""),
+                        height=200,
+                        key=f"body_{cid}",
+                        disabled=is_sent,
+                    )
+                with meta_col:
+                    st.markdown("**Recommended**")
+                    for pid in draft.get("recommended_product_ids", []):
+                        st.markdown(f"- `{pid}`")
+                    st.markdown("**Predicted channel**")
+                    opens = lead.get("email_opens_last_30d", 0)
+                    sms   = lead.get("sms_opted_in", False)
+                    pred  = "📱 SMS" if (sms and opens < 2) else "📧 Email"
+                    st.markdown(pred)
+
+                # ---- Approve / Reject ----
+                if not is_sent:
+                    b_approve, b_reject, _ = st.columns([2, 2, 4])
+
+                    with b_approve:
+                        if st.button(
+                            "✅ Approve & Send",
+                            key=f"approve_{cid}",
+                            type="primary",
+                        ):
+                            with st.status(
+                                f"Sender delivering to {lead['name']}…",
+                                expanded=True,
+                            ) as sstatus:
+                                st.write("📡 Calling `pick_channel` — selecting best channel…")
+                                st.write("📤 Sending message (Resend API / mock)…")
+                                st.write("💾 Logging delivery to MongoDB via MCP `insert-many`…")
+                                try:
+                                    edited_draft = {
+                                        **draft,
+                                        "body": st.session_state.get(
+                                            f"body_{cid}", draft.get("body", "")
+                                        ),
+                                    }
+                                    result, sender_trace = run_sender(lead, edited_draft)
+                                    st.session_state.sent[cid] = {
+                                        "result": result,
+                                        "tool_trace": sender_trace,
+                                    }
+                                    ch       = detect_channel(result)
+                                    ch_label = CHANNEL_LABELS.get(ch, "📨 DELIVERED")
+                                    smcp     = sum(1 for t in sender_trace if t.get("is_mcp"))
+                                    log_event(
+                                        "success",
+                                        f"Sent to {lead['name']} via {ch_label} ({smcp} MCP calls)",
+                                    )
+                                    sstatus.update(
+                                        label=(
+                                            f"✅ Delivered to {lead['name']} — "
+                                            f"{ch_label} · {smcp} MCP calls"
+                                        ),
+                                        state="complete",
+                                        expanded=False,
+                                    )
+                                    st.toast(f"Sent to {lead['name']} via {ch_label}", icon="✅")
+                                    st.rerun()
+                                except Exception as exc:
+                                    log_event("error", f"Sender failed for {lead['name']}: {exc}")
+                                    sstatus.update(
+                                        label=f"❌ Sender error — {lead['name']}",
+                                        state="error",
+                                        expanded=True,
+                                    )
+                                    st.error(f"**Sender error:** {exc}")
+
+                    with b_reject:
+                        if st.button("❌ Reject", key=f"reject_{cid}"):
+                            st.session_state.sent[cid] = {
+                                "result": "rejected", "tool_trace": [],
+                            }
+                            log_event("info", f"Rejected draft for {lead['name']}")
+                            st.toast(f"Draft rejected: {lead['name']}", icon="❌")
+                            st.rerun()
+
+                else:
+                    # Post-send sender trace
+                    sent_info    = st.session_state.sent[cid]
+                    sender_trace = sent_info.get("tool_trace", [])
+                    if sender_trace and sent_info.get("result") != "rejected":
+                        smcp = sum(1 for t in sender_trace if t.get("is_mcp"))
+                        with st.expander(
+                            f"📡 Sender Trace — {len(sender_trace)} tool calls "
+                            f"({smcp} MCP inc. `insert-many` log write)",
+                            expanded=False,
+                        ):
+                            render_trace(sender_trace)
+
+
+if __name__ == "__main__":
+    main()

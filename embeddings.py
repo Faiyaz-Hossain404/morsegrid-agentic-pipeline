@@ -1,32 +1,43 @@
 import os
-from google.cloud import aiplatform
-from vertexai.language_models import TextEmbeddingModel, TextEmbeddingInput
+from google import genai
+from google.genai.types import EmbedContentConfig
 from dotenv import load_dotenv
 
 load_dotenv()
 
-aiplatform.init(
-    project=os.getenv("PROJECT_ID"),
-    location=os.getenv("LOCATION")
-)
+_client = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        _client = genai.Client(
+            vertexai=True,
+            project=os.getenv("PROJECT_ID"),
+            location=os.getenv("LOCATION", "us-central1"),
+        )
+    return _client
+
 
 def get_vertex_embedding(text: str):
-    """Generates vector embedding using structured inputs."""
+    """Generate a 768-dim embedding using text-embedding-004 (google-genai SDK)."""
     try:
-        model = TextEmbeddingModel.from_pretrained("text-embedding-004")
-        text_input = TextEmbeddingInput(text=text, task_type="RETRIEVAL_DOCUMENT")
-        embeddings = model.get_embeddings([text_input])
-        return embeddings[0].values
+        response = _get_client().models.embed_content(
+            model="text-embedding-004",
+            contents=text,
+            config=EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"),
+        )
+        return response.embeddings[0].values
     except Exception as e:
         print(f"\n Error generating embedding: {e}")
         return None
-    
+
 
 if __name__ == "__main__":
     test_text = "Yo Yo Test This Shyt"
     print("Testing Vertex AI Embeddings...")
     vector = get_vertex_embedding(test_text)
-    
+
     if vector:
         print("SUCCESS")
         print(f"Generated Vector Dimensions: {len(vector)}")
