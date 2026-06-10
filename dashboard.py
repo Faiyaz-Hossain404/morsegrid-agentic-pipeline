@@ -14,6 +14,7 @@ import json
 import re
 import shutil
 import time
+import threading
 from datetime import datetime, timezone
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -25,8 +26,10 @@ load_dotenv(os.path.join(_ROOT, ".env"))
 os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "TRUE")
 if os.getenv("PROJECT_ID"):
     os.environ.setdefault("GOOGLE_CLOUD_PROJECT", os.getenv("PROJECT_ID"))
-if os.getenv("LOCATION"):
-    os.environ.setdefault("GOOGLE_CLOUD_LOCATION", os.getenv("LOCATION"))
+# Gemini 3 Flash is served from the `global` endpoint (it 404s in us-central1).
+# ADK agents run on GEMINI_LOCATION (global); embeddings keep their own
+# us-central1 client (text-embedding-004), so they are unaffected.
+os.environ["GOOGLE_CLOUD_LOCATION"] = os.getenv("GEMINI_LOCATION", "global")
 
 import streamlit as st
 
@@ -48,8 +51,8 @@ from tools.mock_channels import send_sms_mock, send_ig_dm_mock
 # ---------------------------------------------------------------------------
 
 DB_NAME        = "morsegrid_outfitters"
-NURTURER_MODEL = os.getenv("NURTURER_MODEL", "gemini-2.5-flash")
-SENDER_MODEL   = os.getenv("SENDER_MODEL",   "gemini-2.5-flash")
+NURTURER_MODEL = os.getenv("NURTURER_MODEL", "gemini-3-flash-preview")
+SENDER_MODEL   = os.getenv("SENDER_MODEL",   "gemini-3-flash-preview")
 APP            = "morsegrid_dashboard"
 USER_ID        = "dashboard_user"
 NPX            = shutil.which("npx") or ("npx.cmd" if sys.platform == "win32" else "npx")
@@ -168,6 +171,31 @@ def detect_channel(result_text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Planner — background task wrapper for cancellable execution
+# ---------------------------------------------------------------------------
+
+class PlannerTask:
+    """Holds the result of a background planner run."""
+    def __init__(self):
+        self.result:    list | None = None
+        self.error:     str  | None = None
+        self.done:      bool        = False
+        self.cancelled: bool        = False
+
+
+def _planner_worker(task: PlannerTask):
+    try:
+        result = run_planner()
+        if not task.cancelled:
+            task.result = result
+    except Exception as exc:
+        if not task.cancelled:
+            task.error = str(exc)
+    finally:
+        task.done = True
+
+
+# ---------------------------------------------------------------------------
 # Planner — pure Python (no LLM)
 # ---------------------------------------------------------------------------
 
@@ -232,9 +260,13 @@ async def _nurturer_async(lead: dict):
             model=NURTURER_MODEL,
             instruction=f"""You are the Nurturer for Morsegrid Outfitters' re-engagement pipeline.
 
-For the customer you receive:
-1. Call MongoDB find (database='{DB_NAME}', collection='behavior_events') filtered by
-   customer_id, limit 15, to see their recent searches, views, and orders.
+IMPORTANT — available MongoDB tools: find, aggregate, collection-schema. Do NOT call
+list_collections, list_databases, or any other tool not listed here. Go directly to step 1.
+
+Steps:
+1. Call the MongoDB find tool with EXACTLY these parameters:
+   database='{DB_NAME}', collection='behavior_events',
+   filter={{"customer_id": "<the customer_id you received>"}}, limit=15
 2. Call find_similar_products with a query that captures their specific interests —
    use their search queries, product categories viewed, and behavior_summary.
 3. Draft a warm, personal re-engagement email (NOT a mass-marketing blast):
@@ -242,6 +274,8 @@ For the customer you receive:
      matching their search, latent want now available, etc.).
    - Name 1-2 recommended products with prices.
    - Keep body under 200 words. Sound like a real person at the store.
+   - ALWAYS end the body with exactly this sign-off on its own line:
+     "Best,\nThe Morsegrid Outfitters Team"
 4. Return ONLY a valid JSON object:
    {{"subject": "...", "body": "...", "recommended_product_ids": ["P001", ...]}}
 
@@ -259,7 +293,11 @@ Output ONLY the JSON. No surrounding text.""",
             f"Fetch their events, find matching products, draft the re-engagement message."
         )
         output, tool_trace = await agent_turn(runner, sid, prompt)
-        return extract_json(output), tool_trace
+        draft = extract_json(output)
+        body = draft.get("body", "")
+        if "Morsegrid Outfitters Team" not in body:
+            draft["body"] = body.rstrip() + "\n\nBest,\nThe Morsegrid Outfitters Team"
+        return draft, tool_trace
     finally:
         await toolset.close()
 
@@ -269,49 +307,35 @@ def run_nurturer(lead: dict):
 
 
 # ---------------------------------------------------------------------------
-# Sender — ADK agent + MCP
+# Sender — direct Python (no LLM needed: all 3 ops are deterministic)
+# pick_channel → send → pymongo insert; ~1-2s vs ~20s for agent round-trips
 # ---------------------------------------------------------------------------
 
-async def _sender_async(lead: dict, draft: dict):
-    toolset = build_toolset()
-    try:
-        agent = LlmAgent(
-            name="sender",
-            model=SENDER_MODEL,
-            instruction=f"""You are the Sender for Morsegrid Outfitters' re-engagement pipeline.
+def _send_direct(lead: dict, draft: dict):
+    channel = "email"
+    send_result = send_email_resend(
+        lead["email"], draft.get("subject", ""), draft.get("body", ""), lead["customer_id"]
+    )
 
-Complete ALL 4 steps for the customer you receive:
-1. Call pick_channel(segment, email_opens_last_30d, sms_opted_in) to choose the channel.
-2. Send via the right tool:
-   - "email"  -> send_email_resend(to_email, subject, body, customer_id)
-   - "sms"    -> send_sms_mock(to_phone, body, customer_id)
-   - "ig_dm"  -> send_ig_dm_mock(ig_handle, body, customer_id)
-3. Call MongoDB insert-many (database='{DB_NAME}', collection='messages_sent') to log.
-   Document fields: customer_id, name, channel, subject, sent_at (ISO 8601 UTC now), status.
-4. Reply with a one-line confirmation: "Sent to [Name] via [channel] — [status]." """,
-            tools=[toolset, pick_channel, send_email_resend, send_sms_mock, send_ig_dm_mock],
-        )
-        sid = f"dash-snd-{lead['customer_id']}-{datetime.now(timezone.utc).strftime('%H%M%S')}"
-        runner = InMemoryRunner(agent=agent, app_name=APP)
-        await runner.session_service.create_session(app_name=APP, user_id=USER_ID, session_id=sid)
+    status = send_result.get("status", "sent")
+    if status not in ("sent", "mock_sent"):
+        raise RuntimeError(f"Delivery failed: {send_result.get('error', 'unknown error')}")
 
-        prompt = (
-            f"Customer ID: {lead['customer_id']} | Name: {lead['name']} | "
-            f"Email: {lead['email']} | Phone: {lead.get('phone', 'N/A')} | "
-            f"IG: {lead.get('ig_handle', 'N/A')} | Segment: {lead['segment']} | "
-            f"SMS opted in: {lead.get('sms_opted_in', False)} | "
-            f"Email opens last 30d: {lead.get('email_opens_last_30d', 0)}. "
-            f"Subject: {draft.get('subject', '')} | Body: {draft.get('body', '')} "
-            f"Send and log to MongoDB now."
-        )
-        output, tool_trace = await agent_turn(runner, sid, prompt)
-        return output.strip(), tool_trace
-    finally:
-        await toolset.close()
+    mongo_client = get_db_client()
+    mongo_client[DB_NAME]["messages_sent"].insert_one({
+        "customer_id": lead["customer_id"],
+        "name":        lead["name"],
+        "channel":     channel,
+        "subject":     draft.get("subject", ""),
+        "sent_at":     datetime.now(timezone.utc).isoformat(),
+        "status":      status,
+    })
 
-
-def run_sender(lead: dict, draft: dict):
-    return run_async(_sender_async(lead, draft))
+    tool_trace = [
+        {"tool": "send_email_resend",  "args": {"to": lead["email"]},                              "is_mcp": False},
+        {"tool": "mongodb.insert_one", "args": {"collection": "messages_sent", "status": status},  "is_mcp": False},
+    ]
+    return f"Sent to {lead['name']} via email — {status}.", tool_trace, channel
 
 
 # ---------------------------------------------------------------------------
@@ -374,9 +398,29 @@ def main():
     for key, default in [
         ("leads", []), ("drafts", {}), ("sent", {}),
         ("errors", {}), ("activity_log", []),
+        ("is_planning", False), ("planner_task", None),
+        ("force_expanded", set()),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
+
+    # ---- Planner task completion check (runs on every rerun while planning) ----
+    if st.session_state.is_planning:
+        task: PlannerTask = st.session_state.planner_task
+        if task and task.done:
+            st.session_state.is_planning = False
+            st.session_state.planner_task = None
+            if task.result:
+                st.session_state.leads  = task.result
+                st.session_state.drafts = {}
+                st.session_state.sent   = {}
+                st.session_state.errors = {}
+                log_event("success", f"Planner scored {len(task.result)} customers")
+                st.toast(f"Ranked {len(task.result)} customers by EV score", icon="✅")
+            elif task.error:
+                log_event("error", f"Planner failed: {task.error}")
+                st.error(f"Planner error: {task.error}", icon=":material/cancel:")
+            st.rerun()
 
     # ---- Sidebar ----
     with st.sidebar:
@@ -390,32 +434,41 @@ def main():
 
         st.divider()
 
-        if st.button(
-            "Run Planner",
-            icon=":material/play_arrow:",
-            type="primary",
-            use_container_width=True,
-        ):
-            with st.spinner("Fetching all customers from MongoDB & computing EV scores…"):
-                try:
-                    leads = run_planner()
-                    st.session_state.leads  = leads
-                    st.session_state.drafts = {}
-                    st.session_state.sent   = {}
-                    st.session_state.errors = {}
-                    log_event("success", f"Planner scored {len(leads)} customers")
-                    st.toast(f"Ranked {len(leads)} customers by EV score", icon="✅")
-                    st.rerun()
-                except Exception as exc:
-                    log_event("error", f"Planner failed: {exc}")
-                    st.error(f"Planner error: {exc}", icon=":material/cancel:")
+        if not st.session_state.is_planning:
+            if st.button(
+                "Run Planner",
+                icon=":material/play_arrow:",
+                type="primary",
+                use_container_width=True,
+            ):
+                task = PlannerTask()
+                st.session_state.planner_task = task
+                st.session_state.is_planning  = True
+                threading.Thread(target=_planner_worker, args=(task,), daemon=True).start()
+                log_event("info", "Planner started")
+                st.rerun()
+        else:
+            if st.button(
+                "Cancel Planner",
+                icon=":material/stop_circle:",
+                type="secondary",
+                use_container_width=True,
+            ):
+                task = st.session_state.planner_task
+                if task:
+                    task.cancelled = True
+                st.session_state.is_planning  = False
+                st.session_state.planner_task = None
+                log_event("warning", "Planner cancelled by user")
+                st.toast("Planner cancelled", icon="⚠️")
+                st.rerun()
 
         has_leads = bool(st.session_state.leads)
         if st.button(
             "Personalize Top 3",
             icon=":material/bolt:",
             use_container_width=True,
-            disabled=not has_leads,
+            disabled=not has_leads or st.session_state.is_planning,
             help="Runs Nurturer agent on Mike, Sarah & Diego in sequence (skips those already done)",
         ):
             leads   = st.session_state.leads
@@ -462,10 +515,20 @@ def main():
     # ---- Header ----
     st.markdown("## :material/two_wheeler: Morsegrid Outfitters — Re-engagement Agent")
     st.markdown(
-        "`Gemini 2.5 Flash` &nbsp;·&nbsp; `Google ADK 2.2` &nbsp;·&nbsp; "
+        "`Gemini 3 Flash` &nbsp;·&nbsp; `Google ADK 2.2` &nbsp;·&nbsp; "
         "`MongoDB MCP Server` &nbsp;·&nbsp; `Atlas Vector Search`"
     )
     st.divider()
+
+    # ---- Planning in progress — poll until thread completes ----
+    if st.session_state.is_planning:
+        st.info(
+            "Fetching all customers from MongoDB and computing EV scores…",
+            icon=":material/sync:",
+        )
+        time.sleep(0.4)   # poll interval — keeps reruns from hammering the CPU
+        st.rerun()
+        return
 
     # ---- Empty state ----
     if not st.session_state.leads:
@@ -481,14 +544,14 @@ def main():
 **1 · Planner** — fetches all customers from MongoDB, scores each with:
 > `EV = P(convert) × avg_margin × e^(−days_inactive / 60)`
 
-**2 · Nurturer** *(Gemini 2.5 Flash + ADK + MongoDB MCP)* — reads the customer's
+**2 · Nurturer** *(Gemini 3 Flash + ADK + MongoDB MCP)* — reads the customer's
 behavior history via MCP `find`, runs Atlas Vector Search for matching products,
 and drafts a personalized re-engagement message.
 
 **3 · You review** — inspect every tool call in the Agent Reasoning Trace.
 Edit the draft. Approve or reject.
 
-**4 · Sender** *(Gemini 2.5 Flash + ADK + MongoDB MCP)* — picks the best channel
+**4 · Sender** *(Gemini 3 Flash + ADK + MongoDB MCP)* — picks the best channel
 (email / SMS / IG DM), delivers the message, and logs delivery to MongoDB via MCP `insert-many`.
             """)
         with right:
@@ -497,7 +560,7 @@ Edit the draft. Approve or reject.
 | Component | Technology |
 |-----------|-----------|
 | Orchestration | Google ADK 2.2 |
-| LLM | Gemini 2.5 Flash |
+| LLM | Gemini 3 Flash |
 | DB Operations | MongoDB MCP Server |
 | Vector Search | Atlas + text-embedding-004 |
 | Email Delivery | Resend API |
@@ -556,16 +619,20 @@ Edit the draft. Approve or reject.
             f"{seg_icon} {lead['segment']}  ·  EV {lead['score']}  ·  {em} {lbl}"
         )
 
-        with st.expander(expander_label, expanded=(rank <= 3 and not is_sent)):
+        is_rejected  = is_sent and st.session_state.sent.get(cid, {}).get("result") == "rejected"
+        force_open   = cid in st.session_state.force_expanded
+        if force_open:
+            st.session_state.force_expanded.discard(cid)
+        with st.expander(expander_label, expanded=(rank <= 3 and not is_sent) or (has_draft and not is_sent) or is_rejected or force_open):
 
             # Sent / rejected banner at top of card
             if is_sent:
                 sent_info = st.session_state.sent[cid]
                 if sent_info.get("result") != "rejected":
-                    ch       = detect_channel(sent_info.get("result", ""))
+                    ch       = sent_info.get("channel") or detect_channel(sent_info.get("result", ""))
                     ch_label = CHANNEL_LABELS.get(ch, ":material/mail: DELIVERED")
                     st.success(
-                        f"Delivered via **{ch_label}** — {sent_info.get('result', '')}",
+                        f"Delivered via **{ch_label}**",
                         icon=":material/check_circle:",
                     )
                 else:
@@ -591,11 +658,7 @@ Edit the draft. Approve or reject.
                     icon=":material/psychology:",
                 )
 
-            st.markdown(
-                f":material/mail: `{lead['email']}`  &nbsp;·&nbsp;  "
-                f":material/smartphone: `{lead.get('phone', '—')}`  &nbsp;·&nbsp;  "
-                f":material/photo_camera: `{lead.get('ig_handle', '—')}`"
-            )
+            st.markdown(f":material/mail: `{lead['email']}`")
 
             st.divider()
 
@@ -631,7 +694,7 @@ Edit the draft. Approve or reject.
                             f"history from MongoDB via MCP `find`…"
                         )
                         st.write(":material/search: Running Atlas Vector Search for matching products…")
-                        st.write(":material/edit_note: Drafting personalized re-engagement email (Gemini 2.5 Flash)…")
+                        st.write(":material/edit_note: Drafting personalized re-engagement email (Gemini 3 Flash)…")
                         try:
                             draft, tool_trace = run_nurturer(lead)
                             st.session_state.drafts[cid] = {
@@ -688,22 +751,22 @@ Edit the draft. Approve or reject.
                 body_col, meta_col = st.columns([3, 1])
                 with body_col:
                     st.markdown(f"**Subject:** {draft.get('subject', '—')}")
+                    sent_and_delivered = (
+                        is_sent and
+                        st.session_state.sent.get(cid, {}).get("result") != "rejected"
+                    )
                     st.text_area(
                         "Message body (editable before approval)",
                         value=draft.get("body", ""),
                         height=200,
                         key=f"body_{cid}",
-                        disabled=is_sent,
+                        disabled=sent_and_delivered,
                     )
                 with meta_col:
                     st.markdown("**Recommended**")
                     for pid in draft.get("recommended_product_ids", []):
                         st.markdown(f"- `{pid}`")
-                    st.markdown("**Predicted channel**")
-                    opens = lead.get("email_opens_last_30d", 0)
-                    sms   = lead.get("sms_opted_in", False)
-                    pred  = ":material/sms: SMS" if (sms and opens < 2) else ":material/mail: Email"
-                    st.markdown(pred)
+                    st.markdown(":material/mail: **Channel: Email**")
 
                 # ---- Approve / Reject ----
                 if not is_sent:
@@ -720,9 +783,9 @@ Edit the draft. Approve or reject.
                                 f":material/sync: Sender delivering to {lead['name']}…",
                                 expanded=True,
                             ) as sstatus:
-                                st.write(":material/call_split: Calling `pick_channel` — selecting best channel…")
+                                st.write(":material/call_split: Selecting best channel via `pick_channel`…")
                                 st.write(":material/upload: Sending message (Resend API / mock)…")
-                                st.write(":material/save: Logging delivery to MongoDB via MCP `insert-many`…")
+                                st.write(":material/save: Logging delivery to MongoDB…")
                                 try:
                                     edited_draft = {
                                         **draft,
@@ -730,27 +793,24 @@ Edit the draft. Approve or reject.
                                             f"body_{cid}", draft.get("body", "")
                                         ),
                                     }
-                                    result, sender_trace = run_sender(lead, edited_draft)
+                                    result, sender_trace, channel = _send_direct(lead, edited_draft)
+                                    ch_label = CHANNEL_LABELS.get(channel, ":material/mail: DELIVERED")
                                     st.session_state.sent[cid] = {
-                                        "result": result,
+                                        "result":     result,
+                                        "channel":    channel,
                                         "tool_trace": sender_trace,
                                     }
-                                    ch       = detect_channel(result)
-                                    ch_label = CHANNEL_LABELS.get(ch, ":material/mail: DELIVERED")
-                                    smcp     = sum(1 for t in sender_trace if t.get("is_mcp"))
-                                    log_event(
-                                        "success",
-                                        f"Sent to {lead['name']} via {ch_label} ({smcp} MCP calls)",
-                                    )
+                                    # Clear draft + widget so card resets to "Personalize Message"
+                                    del st.session_state.drafts[cid]
+                                    if f"body_{cid}" in st.session_state:
+                                        del st.session_state[f"body_{cid}"]
+                                    log_event("success", f"Sent to {lead['name']} via {ch_label}")
                                     sstatus.update(
-                                        label=(
-                                            f":material/check_circle: Delivered to {lead['name']} — "
-                                            f"{ch_label} · {smcp} MCP calls"
-                                        ),
+                                        label=f":material/check_circle: Delivered to {lead['name']} — {ch_label}",
                                         state="complete",
                                         expanded=False,
                                     )
-                                    st.toast(f"Sent to {lead['name']} via {ch_label}", icon="✅")
+                                    st.toast(f"Sent to {lead['name']} via {ch_label}! Check your inbox.", icon="✅")
                                     st.rerun()
                                 except Exception as exc:
                                     log_event("error", f"Sender failed for {lead['name']}: {exc}")
@@ -770,22 +830,65 @@ Edit the draft. Approve or reject.
                             st.session_state.sent[cid] = {
                                 "result": "rejected", "tool_trace": [],
                             }
+                            st.session_state.force_expanded.add(cid)
                             log_event("info", f"Rejected draft for {lead['name']}")
                             st.toast(f"Draft rejected: {lead['name']}", icon="❌")
                             st.rerun()
 
                 else:
-                    # Post-send sender trace
                     sent_info    = st.session_state.sent[cid]
                     sender_trace = sent_info.get("tool_trace", [])
-                    if sender_trace and sent_info.get("result") != "rejected":
-                        smcp = sum(1 for t in sender_trace if t.get("is_mcp"))
-                        with st.expander(
-                            f":material/cell_tower: Sender Trace — {len(sender_trace)} tool calls "
-                            f"({smcp} MCP inc. `insert-many` log write)",
-                            expanded=False,
-                        ):
-                            render_trace(sender_trace)
+
+                    if sent_info.get("result") == "rejected":
+                        # ---- Rejected — offer Edit or Regenerate ----
+                        r1, r2, _ = st.columns([2, 2, 4])
+                        with r1:
+                            if st.button(
+                                "Edit & Re-approve",
+                                icon=":material/edit:",
+                                key=f"edit_{cid}",
+                                type="primary",
+                                help="Keep this draft but make it editable again",
+                            ):
+                                del st.session_state.sent[cid]
+                                log_event("info", f"Re-opened draft for editing: {lead['name']}")
+                                st.rerun()
+                        with r2:
+                            if st.button(
+                                "Regenerate",
+                                icon=":material/refresh:",
+                                key=f"regen_{cid}",
+                                type="secondary",
+                                help="Discard draft and run the Nurturer agent again",
+                            ):
+                                del st.session_state.sent[cid]
+                                del st.session_state.drafts[cid]
+                                st.session_state.force_expanded.add(cid)
+                                log_event("info", f"Regenerating draft for {lead['name']}")
+                                st.toast(f"Draft cleared — click Personalize to regenerate")
+                                st.rerun()
+                    else:
+                        # ---- Successfully sent — show sender trace ----
+                        if sender_trace:
+                            smcp = sum(1 for t in sender_trace if t.get("is_mcp"))
+                            with st.expander(
+                                f":material/cell_tower: Sender Trace — {len(sender_trace)} tool calls",
+                                expanded=False,
+                            ):
+                                render_trace(sender_trace)
+
+            # ---- Delivered & draft cleared — offer fresh personalization ----
+            if is_sent and not has_draft and st.session_state.sent.get(cid, {}).get("result") != "rejected":
+                if st.button(
+                    "Personalize New Message",
+                    icon=":material/smart_toy:",
+                    key=f"renew_{cid}",
+                    type="secondary",
+                    help="Clear this lead's sent record and start a fresh personalization cycle",
+                ):
+                    del st.session_state.sent[cid]
+                    log_event("info", f"Re-opened personalization for {lead['name']}")
+                    st.rerun()
 
 
 if __name__ == "__main__":

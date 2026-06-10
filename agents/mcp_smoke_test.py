@@ -32,10 +32,9 @@ from google.adk.tools.mcp_tool import McpToolset, StdioConnectionParams
 from mcp import StdioServerParameters
 from google.genai import types
 
-# Exact Gemini 3 model id — override in .env (GEMINI_MODEL=...) if yours differs.
-# "Gemini 3" in Google's product line = gemini-2.5-pro in the Vertex API.
-# gemini-2.5-flash is also available and faster/cheaper for Planner/Sender.
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+# Gemini 3 Flash — served from the `global` Vertex endpoint.
+# Override via GEMINI_MODEL env var if needed.
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 DB_NAME = "morsegrid_outfitters"
 APP, USER, SESSION = "morsegrid_smoke", "faiyaz", "smoke-1"
 

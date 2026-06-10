@@ -26,8 +26,10 @@ load_dotenv(os.path.join(_ROOT, ".env"))
 os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "TRUE")
 if os.getenv("PROJECT_ID"):
     os.environ.setdefault("GOOGLE_CLOUD_PROJECT", os.getenv("PROJECT_ID"))
-if os.getenv("LOCATION"):
-    os.environ.setdefault("GOOGLE_CLOUD_LOCATION", os.getenv("LOCATION"))
+# Gemini 3 Flash is served from the `global` endpoint (it 404s in us-central1).
+# ADK agents run on GEMINI_LOCATION (global); embeddings keep their own
+# us-central1 client (text-embedding-004), so they are unaffected.
+os.environ["GOOGLE_CLOUD_LOCATION"] = os.getenv("GEMINI_LOCATION", "global")
 
 from google.adk.agents import LlmAgent
 from google.adk.runners import InMemoryRunner
@@ -43,9 +45,9 @@ from tools.mock_channels import send_sms_mock, send_ig_dm_mock
 from db.mongo import get_db_client
 
 DB_NAME = "morsegrid_outfitters"
-PLANNER_MODEL  = os.getenv("PLANNER_MODEL",  "gemini-2.5-flash")
-NURTURER_MODEL = os.getenv("NURTURER_MODEL", "gemini-2.5-flash")
-SENDER_MODEL   = os.getenv("SENDER_MODEL",   "gemini-2.5-flash")
+PLANNER_MODEL  = os.getenv("PLANNER_MODEL",  "gemini-3-flash-preview")
+NURTURER_MODEL = os.getenv("NURTURER_MODEL", "gemini-3-flash-preview")
+SENDER_MODEL   = os.getenv("SENDER_MODEL",   "gemini-3-flash-preview")
 APP  = "morsegrid_pipeline"
 USER = "pipeline_runner"
 NPX  = shutil.which("npx") or ("npx.cmd" if sys.platform == "win32" else "npx")
@@ -227,9 +229,13 @@ async def run_pipeline():
             model=NURTURER_MODEL,
             instruction=f"""You are the Nurturer for Morsegrid Outfitters' re-engagement pipeline.
 
-For the customer you are given:
-1. Call MongoDB find (database='{DB_NAME}', collection='behavior_events') filtered by
-   customer_id, limit 15, to see their searches, views, and order history.
+IMPORTANT — available MongoDB tools: find, aggregate, collection-schema. Do NOT call
+list_collections, list_databases, or any other tool not listed here. Go directly to step 1.
+
+Steps:
+1. Call the MongoDB find tool with EXACTLY these parameters:
+   database='{DB_NAME}', collection='behavior_events',
+   filter={{"customer_id": "<the customer_id you received>"}}, limit=15
 2. Call find_similar_products with a query that reflects their specific interests —
    use their search queries, viewed product tags, and behavior_summary.
 3. Draft a warm, personal re-engagement email:
@@ -237,6 +243,8 @@ For the customer you are given:
    - Reference the specific reason we are reaching out (back in stock, new arrival, etc.).
    - Name 1-2 recommended products with approximate prices.
    - Keep body under 200 words.
+   - ALWAYS end the body with exactly this sign-off on its own line:
+     "Best,\nThe Morsegrid Outfitters Team"
 4. Return ONLY a valid JSON object:
    {{ "subject": "...", "body": "...", "recommended_product_ids": ["P001", ...] }}
 

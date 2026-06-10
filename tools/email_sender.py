@@ -33,9 +33,16 @@ def send_email_resend(
         return {"status": "error", "error": "RESEND_API_KEY not set", "customer_id": customer_id}
 
     actual_to = demo_to if demo_to else to_email
+
+    paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
+    inner_html  = "".join(
+        f"<p style='margin:0 0 14px 0'>{p.replace(chr(10), '<br>')}</p>"
+        for p in paragraphs
+    )
     html_body = (
-        "<div style='font-family:sans-serif;max-width:600px;margin:0 auto;padding:24px'>"
-        + body.replace("\n\n", "</p><p>").replace("\n", "<br>")
+        "<div style='font-family:sans-serif;font-size:15px;line-height:1.6;"
+        "max-width:600px;margin:0 auto;padding:32px 24px;color:#222'>"
+        + inner_html
         + "</div>"
     )
 
@@ -43,7 +50,7 @@ def send_email_resend(
         "from": from_email,
         "to": [actual_to],
         "subject": subject,
-        "html": f"<p>{html_body}</p>",
+        "html": html_body,
         "reply_to": to_email,
     }
 
