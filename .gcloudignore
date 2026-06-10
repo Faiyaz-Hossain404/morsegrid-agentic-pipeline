@@ -1,0 +1,15 @@
+# Keep the Cloud Build upload small and free of secrets.
+.git/
+.gitignore
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.env
+.env.yaml
+*.log
+_tmp_*
+_boot_*
+PLAN.md
+HANDOFF.md
+README_assets/

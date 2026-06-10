@@ -6,6 +6,23 @@ __pycache__/
 # C extensions
 *.so
 
+# Secrets & deploy config (NEVER commit)
+.env
+.env.*
+!.env.example
+.env.yaml
+*.local
+credentials.json
+token.json
+
+# Internal planning notes (contain live secrets / not for public repo)
+HANDOFF.md
+
+# Scratch / logs
+_tmp_*
+_boot_*
+*.log
+
 # Distribution / packaging
 .Python
 build/
@@ -218,3 +235,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Google OAuth client + cached user token (never commit these)
+credentials.json
+token.json

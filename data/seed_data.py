@@ -1,3 +1,14 @@
+"""
+Morsegrid Outfitters — synthetic data seeder.
+
+Seeds an ecommerce store with TWO kinds of revenue-recovery opportunities:
+  1. Abandoned carts            -> collection `abandoned_carts`  (time-sensitive)
+  2. Dormant / lapsed customers -> scored from `customers` + `behavior_events`
+
+The same agent pipeline (Planner -> Nurturer -> Sender) handles both.
+All runtime DB access by the agents goes through the MongoDB MCP server; this
+offline seeder uses pymongo (dev-time ETL, allowed by the hackathon rules).
+"""
 import os
 import sys
 import random
@@ -15,6 +26,10 @@ NOW = datetime.now(timezone.utc)
 
 def days_ago(n):
     return NOW - timedelta(days=n)
+
+
+def hours_ago(n):
+    return NOW - timedelta(hours=n)
 
 
 def rand_between(d_old, d_new):
@@ -43,18 +58,18 @@ def mk(pid, title, category, price, desc, tags,
 
 
 PRODUCTS = [
-    # --- Hero products for the 3 demo scenarios ---
+    # --- Products that anchor the demo scenarios ---
     mk("P001", "Rallye Adventure Helmet", "Helmets", 350.00,
        "Dual-sport adventure helmet with drop-down sun visor and an ultra-wide field of view. Premium aerodynamics for long dual-sport and off-road touring.",
        ["adventure", "dual-sport", "touring", "off-road", "sun-visor"],
-       cost=150.00, created_days_ago=300, restocked_days_ago=2),  # scenario 1: back in stock
+       cost=150.00, created_days_ago=300, restocked_days_ago=2),
     mk("P002", "Apex Carbon Full-Face Helmet", "Helmets", 599.00,
        "Ultra-lightweight aerospace carbon-fiber shell with maximum track ventilation and an optically correct race shield.",
        ["carbon", "full-face", "track", "race", "lightweight"], cost=250.00, created_days_ago=200),
     mk("P003", "Classic Leather Cafe Racer Jacket", "Jackets", 450.00,
        "Premium top-grain cowhide cafe racer jacket with CE armor inserts and a vintage distressed finish.",
        ["cafe-racer", "leather", "vintage", "ce-armor", "retro"],
-       cost=180.00, created_days_ago=7),  # scenario 3: new arrival
+       cost=180.00, created_days_ago=7),  # new arrival
 
     # --- Helmets ---
     mk("P004", "Vega Modular Flip-Up Helmet", "Helmets", 280.00,
@@ -127,7 +142,7 @@ PRODUCTS = [
        ["adventure", "touring", "waterproof", "cargo"]),
     mk("P024", "Leather Track Pants", "Pants", 350.00,
        "Perforated leather track pants with stretch panels and knee-slider attachment points.",
-       ["leather", "track", "race", "perforated"], in_stock=False),
+       ["leather", "track", "race", "perforated"], in_stock=False),  # SOLD OUT — drives alt scenario
     mk("P025", "Textile Waterproof Over-Pants", "Pants", 150.00,
        "Packable waterproof over-pants that slip over jeans for sudden downpours.",
        ["waterproof", "over-pants", "rain", "packable"]),
@@ -200,7 +215,7 @@ PRODUCTS = [
        "Reusable filtered ear plugs that cut wind noise while keeping you aware.",
        ["ear-plugs", "comfort", "safety"]),
 
-    # --- Cafe-racer collection (supports scenario 3 cross-sell) ---
+    # --- Cafe-racer collection (new arrivals — supports latent-want re-engagement) ---
     mk("P048", "Cafe Racer Riding Gloves", "Gloves", 100.00,
        "Vintage-look perforated leather cafe racer gloves with low-profile knuckle protection.",
        ["cafe-racer", "leather", "vintage", "short"], created_days_ago=7),
@@ -208,21 +223,24 @@ PRODUCTS = [
        "Retro cafe-racer leather ankle boots with concealed ankle armor and a cap toe.",
        ["cafe-racer", "leather", "retro", "ankle"], created_days_ago=7),
 
-    # --- New helmet drop (supports scenario 2 channel-switch) ---
+    # --- New helmet drop (supports VIP win-back) ---
     mk("P050", "Aurora Sport Helmet", "Helmets", 300.00,
        "Newly released sport full-face helmet with a fresh colorway, optimized aero, and emergency cheek-pad release.",
        ["sport", "full-face", "new", "aero"], created_days_ago=4),
 ]
 
+PROD = {p["product_id"]: p for p in PRODUCTS}
 PRICE = {p["product_id"]: p["price"] for p in PRODUCTS}
 PRODUCT_IDS = [p["product_id"] for p in PRODUCTS]
 
 
 # ----------------------------------------------------------------------------
-# Event / order helpers
+# Event / order / cart helpers
 # ----------------------------------------------------------------------------
 EVENTS = []
 ORDERS = []
+CARTS = []
+_cart_seq = 1000
 
 
 def add_event(cid, type_, ts, product_id=None, query=None, meta=None):
@@ -252,6 +270,59 @@ def make_orders(cid, n, earliest, latest):
     return made
 
 
+# Cart funnel stages, ordered by how close the shopper got to buying.
+STAGE_INTENT = {"cart": 0.30, "checkout_started": 0.50, "payment_info": 0.70}
+
+
+def add_abandoned_cart(cid, product_ids, abandoned_at, stage="checkout_started",
+                       source="shopify", note=None):
+    """
+    Create an abandoned-cart document (the kind of payload a Shopify
+    'checkouts/abandoned' webhook would deliver) plus the matching
+    cart_add / checkout_start / cart_abandon behavior events.
+    """
+    global _cart_seq
+    _cart_seq += 1
+    cart_id = f"CART-{_cart_seq}"
+    items = [{
+        "product_id": pid,
+        "title": PROD[pid]["title"],
+        "price": PRICE[pid],
+        "qty": 1,
+        "in_stock_now": PROD[pid]["in_stock"],
+    } for pid in product_ids]
+    cart_value = round(sum(i["price"] for i in items), 2)
+
+    cart_doc = {
+        "cart_id": cart_id,
+        "customer_id": cid,
+        "source": source,                       # shopify | woocommerce | custom
+        "stage": stage,                         # how far down the funnel
+        "items": items,
+        "cart_value": cart_value,
+        "currency": "USD",
+        "created_at": abandoned_at,             # when it was abandoned
+        "checkout_url": f"https://morsegrid-demo.myshopify.com/cart/{cart_id}",
+        "recovered": False,
+        "recovery_status": "pending",           # pending | sent | recovered
+    }
+    if note:
+        cart_doc["note"] = note
+    CARTS.append(cart_doc)
+
+    # Behavior trail leading up to the abandon
+    for pid in product_ids:
+        add_event(cid, "view", abandoned_at - timedelta(minutes=40), product_id=pid)
+        add_event(cid, "cart_add", abandoned_at - timedelta(minutes=30),
+                  product_id=pid, meta={"cart_id": cart_id})
+    if stage in ("checkout_started", "payment_info"):
+        add_event(cid, "checkout_start", abandoned_at - timedelta(minutes=12),
+                  meta={"cart_id": cart_id, "cart_value": cart_value})
+    add_event(cid, "cart_abandon", abandoned_at, product_id=product_ids[0],
+              meta={"cart_id": cart_id, "cart_value": cart_value, "stage": stage})
+    return cart_doc
+
+
 SEARCH_TERMS = [
     "adventure touring helmet", "summer mesh gloves", "waterproof boots",
     "leather cafe racer jacket", "kevlar riding jeans", "bluetooth intercom",
@@ -272,9 +343,9 @@ def build_generic(cid, name, segment):
     elif segment == "one-time":
         n_orders = 1; open_rate = round(random.uniform(0.20, 0.50), 2); last_active = days_ago(random.randint(40, 95))
     elif segment == "cart-abandoner":
-        n_orders = 0; open_rate = round(random.uniform(0.30, 0.60), 2); last_active = days_ago(random.randint(2, 12))
-    else:  # cold
-        n_orders = 0; open_rate = round(random.uniform(0.05, 0.35), 2); last_active = days_ago(random.randint(70, 160))
+        n_orders = random.randint(0, 1); open_rate = round(random.uniform(0.30, 0.60), 2); last_active = days_ago(random.randint(1, 5))
+    else:  # cold / dormant
+        n_orders = random.randint(0, 1); open_rate = round(random.uniform(0.05, 0.35), 2); last_active = days_ago(random.randint(70, 160))
 
     sms_optin = random.random() < 0.6
     last5 = [random.random() < open_rate for _ in range(5)]
@@ -286,15 +357,16 @@ def build_generic(cid, name, segment):
         add_event(cid, "view", rand_between(created, last_active), product_id=random.choice(PRODUCT_IDS))
     if random.random() < 0.5:  # search
         add_event(cid, "search", rand_between(created, last_active), query=random.choice(SEARCH_TERMS))
-    pairs = 2 if segment == "cart-abandoner" else (1 if random.random() < 0.3 else 0)  # cart abandons
-    for _ in range(pairs):
-        pid = random.choice(PRODUCT_IDS)
-        t = rand_between(last_active - timedelta(days=4), last_active)
-        add_event(cid, "cart_add", t, product_id=pid)
-        add_event(cid, "cart_abandon", t + timedelta(minutes=18), product_id=pid)
     for _ in range(random.randint(2, 4)):  # email engagement
         t = rand_between(last_active - timedelta(days=30), last_active)
         add_event(cid, "email_open" if random.random() < open_rate else "email_sent", t)
+
+    # cart-abandoner generics get a real abandoned cart for queue depth
+    if segment == "cart-abandoner":
+        n_items = random.choice([1, 1, 2])
+        pids = random.sample([p for p in PRODUCT_IDS if PROD[p]["in_stock"]], k=n_items)
+        stage = random.choice(["cart", "checkout_started", "checkout_started", "payment_info"])
+        add_abandoned_cart(cid, pids, hours_ago(random.randint(5, 70)), stage=stage)
 
     summary = (f"{segment} customer, {n_orders} orders (~${spend:.0f} lifetime), "
                f"email open rate {int(open_rate * 100)}%, last active {(NOW - last_active).days} days ago. "
@@ -312,82 +384,125 @@ def build_generic(cid, name, segment):
 
 
 # ----------------------------------------------------------------------------
-# 2. Customers — 3 hero personas + 15 generics
+# 2. Hero personas — 3 abandoned-cart + 2 dormant re-engagement
 # ----------------------------------------------------------------------------
+
+# --- C001 Mike: high-value cart, reached payment, abandoned 3h ago (REASSURE) ---
 mike = {
     "customer_id": "C001", "name": "Mike Henderson", "email": "mike.h.testapp@gmail.com",
-    "phone": "+15550192", "ig_handle": "@mike_rides", "segment": "engaged",
-    "total_orders": 0, "total_spend": 0.0,
-    "created_at": days_ago(90), "last_active_at": days_ago(2),
-    "engagement": {"open_rate": 0.85, "click_rate": 0.40, "sms_optin": True, "last5_opens": [True, True, False, True, True]},
-    "behavior_summary": "Inquired explicitly about the Rallye Adventure Helmet via the chat widget when it was flagged out of stock. Prefers premium adventure headgear.",
+    "phone": "+15550192", "ig_handle": "@mike_rides", "segment": "cart-abandoner",
+    "created_at": days_ago(95), "last_active_at": hours_ago(3),
+    "engagement": {"open_rate": 0.80, "click_rate": 0.40, "sms_optin": True,
+                   "last5_opens": [True, True, False, True, True]},
+    "behavior_summary": ("Reached the payment step on a $599 Apex Carbon Full-Face Helmet, then "
+                         "abandoned the checkout 3 hours ago. High intent on premium track headgear; "
+                         "highly email-responsive."),
 }
+# --- C002 Sarah: $700 two-item cart, 0/5 email opens -> SMS channel switch ---
 sarah = {
     "customer_id": "C002", "name": "Sarah Jenkins", "email": "sarah.j.testapp@gmail.com",
-    "phone": "+15558831", "ig_handle": "@sarah_moto", "segment": "dormant_email",
-    "total_orders": 0, "total_spend": 0.0,
-    "created_at": days_ago(120), "last_active_at": days_ago(14),
-    "engagement": {"open_rate": 0.05, "click_rate": 0.00, "sms_optin": True, "last5_opens": [False, False, False, False, False]},
-    "behavior_summary": "Browsed high-end carbon and sport helmets heavily two weeks ago but has ignored the last 5 broadcast marketing emails. SMS opt-in is active.",
+    "phone": "+15558831", "ig_handle": "@sarah_moto", "segment": "cart-abandoner",
+    "created_at": days_ago(120), "last_active_at": hours_ago(6),
+    "engagement": {"open_rate": 0.05, "click_rate": 0.00, "sms_optin": True,
+                   "last5_opens": [False, False, False, False, False]},
+    "behavior_summary": ("Abandoned a $700 two-item adventure kit (Trailblazer touring jacket + ADV "
+                         "boots) at checkout 6 hours ago. Has not opened any of the last 5 emails; "
+                         "SMS opt-in is active."),
 }
+# --- C003 Diego: cart item now SOLD OUT -> suggest in-stock alternatives ---
 diego = {
     "customer_id": "C003", "name": "Diego Alvarez", "email": "diego.a.testapp@gmail.com",
-    "phone": "+15559923", "ig_handle": "@diego_customs", "segment": "engaged",
-    "total_orders": 0, "total_spend": 0.0,
-    "created_at": days_ago(60), "last_active_at": days_ago(4),
-    "engagement": {"open_rate": 0.70, "click_rate": 0.35, "sms_optin": False, "last5_opens": [True, False, True, True, False]},
-    "behavior_summary": "Searched for a 'cafe racer jacket' six weeks ago when none were in inventory. High email engagement; not opted into SMS.",
+    "phone": "+15559923", "ig_handle": "@diego_customs", "segment": "cart-abandoner",
+    "created_at": days_ago(70), "last_active_at": hours_ago(28),
+    "engagement": {"open_rate": 0.70, "click_rate": 0.35, "sms_optin": False,
+                   "last5_opens": [True, False, True, True, False]},
+    "behavior_summary": ("Added the Leather Track Pants to cart yesterday, then abandoned at the cart "
+                         "stage. That exact item has since sold out — needs strong in-stock "
+                         "alternatives. High email engagement."),
+}
+# --- C004 Ava: VIP gone quiet 78 days -> win-back tied to a new arrival ---
+ava = {
+    "customer_id": "C004", "name": "Ava Thompson", "email": "ava.t.testapp@gmail.com",
+    "phone": "+15557741", "ig_handle": "@ava_adv", "segment": "dormant_vip",
+    "created_at": days_ago(420), "last_active_at": days_ago(78),
+    "engagement": {"open_rate": 0.55, "click_rate": 0.25, "sms_optin": False,
+                   "last5_opens": [True, False, False, True, False]},
+    "behavior_summary": ("VIP with 4 lifetime orders (~$1,450) who has been quiet for 78 days. "
+                         "Consistently buys premium sport and full-face helmets. The new Aurora Sport "
+                         "Helmet just dropped this week."),
+}
+# --- C005 Marcus: latent want -> searched cafe racer jacket long ago, in stock now ---
+marcus = {
+    "customer_id": "C005", "name": "Marcus Webb", "email": "marcus.w.testapp@gmail.com",
+    "phone": "+15553360", "ig_handle": "@marcus_caferacer", "segment": "dormant_email",
+    "created_at": days_ago(140), "last_active_at": days_ago(50),
+    "engagement": {"open_rate": 0.45, "click_rate": 0.20, "sms_optin": True,
+                   "last5_opens": [True, False, True, False, False]},
+    "behavior_summary": ("Searched for a 'vintage cafe racer jacket' ~50 days ago when none were in "
+                         "stock, then went quiet. The Classic Leather Cafe Racer Jacket arrived a week "
+                         "ago. Moderate email engagement; SMS opt-in active."),
 }
 
-HEROES = [mike, sarah, diego]
+HEROES = [mike, sarah, diego, ava, marcus]
+HERO_CART_IDS = ["C001", "C002", "C003"]
+HERO_DORMANT_IDS = ["C004", "C005"]
 
-# Hero orders (derive total_orders/total_spend from generated orders for consistency)
-for cust, n in [(mike, 2), (sarah, 1), (diego, 3)]:
-    co = make_orders(cust["customer_id"], n, cust["created_at"], cust["last_active_at"])
+# Hero lifetime orders (gives them realistic spend history)
+for cust, n in [(mike, 1), (sarah, 1), (diego, 2), (ava, 4), (marcus, 1)]:
+    co = make_orders(cust["customer_id"], n, cust["created_at"],
+                     cust["last_active_at"] if cust["customer_id"] in HERO_DORMANT_IDS
+                     else cust["created_at"] + timedelta(days=20))
     cust["total_orders"] = len(co)
     cust["total_spend"] = round(sum(o["total"] for o in co), 2)
 
-# Scenario-critical events
-# Scenario 1 — Mike asked about an out-of-stock helmet that is now restocked
-add_event("C001", "chat", days_ago(60), product_id="P001",
-          query="Is the Rallye Adventure Helmet coming back in stock soon?")
-add_event("C001", "view", days_ago(60), product_id="P001")
-add_event("C001", "email_open", days_ago(8))
-# Scenario 2 — Sarah browses helmets but ignores email (5 sent, 0 opened)
-add_event("C002", "view", days_ago(14), product_id="P002")
-add_event("C002", "view", days_ago(13), product_id="P050")
-add_event("C002", "view", days_ago(12), product_id="P004")
-for d in [20, 15, 11, 7, 3]:
-    add_event("C002", "email_sent", days_ago(d))
-# Scenario 3 — Diego searched for a cafe racer jacket 6 weeks ago; none existed then
-add_event("C003", "search", days_ago(42), query="vintage cafe racer jacket leather")
-add_event("C003", "view", days_ago(42), product_id="P010")
-add_event("C003", "view", days_ago(42), product_id="P012")
-add_event("C003", "email_open", days_ago(5))
+# --- Hero abandoned carts ---
+# C001 — single premium item, reached payment, 3h ago
+add_abandoned_cart("C001", ["P002"], hours_ago(3), stage="payment_info",
+                   note="High-value single item; shopper reached the payment step.")
+# C002 — two-item adventure kit, checkout started, 6h ago
+add_abandoned_cart("C002", ["P008", "P019"], hours_ago(6), stage="checkout_started",
+                   note="Two-item kit; email-unresponsive, SMS opt-in active.")
+# C003 — leather track pants (now sold out), cart stage, ~28h ago
+add_abandoned_cart("C003", ["P024"], hours_ago(28), stage="cart",
+                   note="Item sold out after abandon; needs in-stock alternatives.")
 
+# --- Hero dormant signals (re-engagement, no cart) ---
+# C004 Ava — past sport-helmet affinity + recent open
+add_event("C004", "view", days_ago(120), product_id="P002")
+add_event("C004", "view", days_ago(110), product_id="P007")
+add_event("C004", "search", days_ago(118), query="lightweight sport full-face helmet")
+add_event("C004", "email_open", days_ago(82))
+# C005 Marcus — the latent want
+add_event("C005", "search", days_ago(50), query="vintage cafe racer jacket leather")
+add_event("C005", "view", days_ago(50), product_id="P010")
+add_event("C005", "view", days_ago(50), product_id="P012")
+add_event("C005", "email_open", days_ago(48))
+
+
+# ----------------------------------------------------------------------------
+# 3. Generic customers (queue depth + a few more abandoned carts)
+# ----------------------------------------------------------------------------
 GENERIC = [
-    ("C004", "Ava Thompson", "VIP"),
-    ("C005", "Liam Carter", "VIP"),
-    ("C006", "Noah Bennett", "repeat"),
-    ("C007", "Emma Davis", "repeat"),
-    ("C008", "Olivia Wright", "repeat"),
-    ("C009", "James Cole", "one-time"),
-    ("C010", "Sophia Reed", "one-time"),
-    ("C011", "Lucas Gray", "cart-abandoner"),
-    ("C012", "Mia Foster", "cart-abandoner"),
-    ("C013", "Ethan Ward", "cart-abandoner"),
-    ("C014", "Isabella King", "cold"),
-    ("C015", "Mason Hughes", "cold"),
-    ("C016", "Charlotte Bell", "cold"),
-    ("C017", "Benjamin Ross", "repeat"),
-    ("C018", "Amelia Price", "one-time"),
+    ("C006", "Liam Carter", "VIP"),
+    ("C007", "Noah Bennett", "repeat"),
+    ("C008", "Emma Davis", "repeat"),
+    ("C009", "Olivia Wright", "repeat"),
+    ("C010", "James Cole", "one-time"),
+    ("C011", "Sophia Reed", "one-time"),
+    ("C012", "Lucas Gray", "cart-abandoner"),
+    ("C013", "Mia Foster", "cart-abandoner"),
+    ("C014", "Ethan Ward", "cart-abandoner"),
+    ("C015", "Isabella King", "cold"),
+    ("C016", "Mason Hughes", "cold"),
+    ("C017", "Charlotte Bell", "cold"),
+    ("C018", "Benjamin Ross", "repeat"),
 ]
 
 CUSTOMERS = HEROES + [build_generic(cid, name, seg) for cid, name, seg in GENERIC]
 
 
 # ----------------------------------------------------------------------------
-# 3. Seed
+# 4. Seed
 # ----------------------------------------------------------------------------
 def seed_database():
     client = get_db_client()
@@ -397,7 +512,8 @@ def seed_database():
 
     db = client["morsegrid_outfitters"]
     print("Starting clean database seeding...")
-    for c in ["products", "customers", "behavior_events", "orders", "messages_sent"]:
+    for c in ["products", "customers", "behavior_events", "orders",
+              "abandoned_carts", "messages_sent"]:
         db[c].drop()
 
     db.products.insert_many(PRODUCTS)
@@ -409,6 +525,9 @@ def seed_database():
     print(f"OK - orders:          {len(ORDERS)}")
     db.behavior_events.insert_many(EVENTS)
     print(f"OK - behavior_events: {len(EVENTS)}")
+    db.abandoned_carts.insert_many(CARTS)
+    print(f"OK - abandoned_carts: {len(CARTS)}  "
+          f"(value ${sum(c['cart_value'] for c in CARTS):,.0f})")
     print("DONE - seeding complete. Vectors NOT set yet -> run data/build_index.py next.")
     client.close()
 
