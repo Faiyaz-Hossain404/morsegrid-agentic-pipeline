@@ -375,7 +375,7 @@ def main():
         ("leads", []), ("drafts", {}), ("sent", {}),
         ("errors", {}), ("activity_log", []),
         ("is_planning", False), ("planner_task", None),
-        ("force_expanded", set()),
+        ("force_expanded", set()), ("reject_count", 0),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -541,8 +541,8 @@ alternatives, or a complement), and drafts a personalized message.
     opps = st.session_state.leads
     cart_opps = [o for o in opps if o["opp_type"] == "abandoned_cart"]
     value_at_risk = sum(o.get("cart_value", 0) for o in cart_opps)
-    sent_count = sum(1 for v in st.session_state.sent.values() if v.get("result") != "rejected")
-    rejected_count = sum(1 for v in st.session_state.sent.values() if v.get("result") == "rejected")
+    sent_count = len(st.session_state.sent)
+    rejected_count = st.session_state.get("reject_count", 0)
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Opportunities", len(opps))
@@ -586,21 +586,18 @@ alternatives, or a complement), and drafts a personalized message.
             f"EV ${opp['score']}  ·  {em} {lbl}"
         )
 
-        is_rejected  = is_sent and st.session_state.sent.get(cid, {}).get("result") == "rejected"
         force_open   = cid in st.session_state.force_expanded
         if force_open:
             st.session_state.force_expanded.discard(cid)
-        with st.expander(expander_label, expanded=(rank <= 3 and not is_sent) or (has_draft and not is_sent) or is_rejected or force_open):
+        # Keep a card open while it has a draft, is a top pick, was just delivered, or just reset.
+        with st.expander(expander_label, expanded=is_sent or force_open or (rank <= 3 and not is_sent) or (has_draft and not is_sent)):
 
             if is_sent:
                 sent_info = st.session_state.sent[cid]
-                if sent_info.get("result") != "rejected":
-                    ch       = sent_info.get("channel", "email")
-                    ch_label = CHANNEL_LABELS.get(ch, ":material/mail: DELIVERED")
-                    reason   = sent_info.get("channel_reason", "")
-                    st.success(f"Delivered via **{ch_label}** — {reason}", icon=":material/check_circle:")
-                else:
-                    st.error("Draft rejected — message was not sent.", icon=":material/cancel:")
+                ch       = sent_info.get("channel", "email")
+                ch_label = CHANNEL_LABELS.get(ch, ":material/mail: DELIVERED")
+                reason   = sent_info.get("channel_reason", "")
+                st.success(f"Delivered via **{ch_label}** — {reason}", icon=":material/check_circle:")
 
             # Opportunity context
             if opp["opp_type"] == "abandoned_cart":
@@ -679,7 +676,7 @@ alternatives, or a complement), and drafts a personalized message.
                 body_col, meta_col = st.columns([3, 1])
                 with body_col:
                     st.markdown(f"**Subject:** {draft.get('subject', '—')}")
-                    sent_ok = is_sent and st.session_state.sent.get(cid, {}).get("result") != "rejected"
+                    sent_ok = is_sent
                     st.text_area("Message body (editable before approval)", value=draft.get("body", ""),
                                  height=210, key=f"body_{cid}", disabled=sent_ok)
                 with meta_col:
@@ -709,6 +706,7 @@ alternatives, or a complement), and drafts a personalized message.
                                     log_event("success", f"Sent to {opp['name']} via {channel}")
                                     sstatus.update(label=f":material/check_circle: Delivered — {ch_label}",
                                                    state="complete", expanded=False)
+                                    st.session_state.force_expanded.add(cid)
                                     st.toast(f"Sent to {opp['name']} via {channel}!", icon="✅")
                                     st.rerun()
                                 except Exception as exc:
@@ -716,30 +714,20 @@ alternatives, or a complement), and drafts a personalized message.
                                     sstatus.update(label=f":material/cancel: Sender error — {opp['name']}", state="error", expanded=True)
                                     st.error(f"**Sender error:** {exc}", icon=":material/cancel:")
                     with b_reject:
-                        if st.button("Reject", icon=":material/block:", key=f"reject_{cid}"):
-                            st.session_state.sent[cid] = {"result": "rejected", "tool_trace": []}
+                        if st.button("Reject", icon=":material/block:", key=f"reject_{cid}",
+                                     help="Discard this draft and return to Personalize"):
+                            st.session_state.drafts.pop(cid, None)
+                            st.session_state.pop(f"body_{cid}", None)
+                            st.session_state.sent.pop(cid, None)
+                            st.session_state.reject_count = st.session_state.get("reject_count", 0) + 1
                             st.session_state.force_expanded.add(cid)
-                            log_event("info", f"Rejected draft for {opp['name']}")
+                            log_event("info", f"Rejected draft for {opp['name']} — ready to re-personalize")
                             st.rerun()
                 else:
-                    sent_info    = st.session_state.sent[cid]
-                    sender_trace = sent_info.get("tool_trace", [])
-                    if sent_info.get("result") == "rejected":
-                        r1, r2, _ = st.columns([2, 2, 4])
-                        with r1:
-                            if st.button("Edit & Re-approve", icon=":material/edit:", key=f"edit_{cid}", type="primary"):
-                                del st.session_state.sent[cid]
-                                st.rerun()
-                        with r2:
-                            if st.button("Regenerate", icon=":material/refresh:", key=f"regen_{cid}", type="secondary"):
-                                del st.session_state.sent[cid]
-                                del st.session_state.drafts[cid]
-                                st.session_state.force_expanded.add(cid)
-                                st.rerun()
-                    else:
-                        if sender_trace:
-                            with st.expander(f":material/cell_tower: Sender Trace — {len(sender_trace)} tool calls", expanded=False):
-                                render_trace(sender_trace)
+                    sender_trace = st.session_state.sent[cid].get("tool_trace", [])
+                    if sender_trace:
+                        with st.expander(f":material/cell_tower: Sender Trace — {len(sender_trace)} tool calls", expanded=False):
+                            render_trace(sender_trace)
 
             if is_sent and not has_draft and st.session_state.sent.get(cid, {}).get("result") != "rejected":
                 if st.button("Personalize New Message", icon=":material/smart_toy:", key=f"renew_{cid}", type="secondary"):

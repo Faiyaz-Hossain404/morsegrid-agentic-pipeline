@@ -1,6 +1,8 @@
 import os
+import re
 import sys
 import base64
+import html as _html
 from email.mime.text import MIMEText
 
 import requests
@@ -9,19 +11,41 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
 
+def _style_inline(text: str) -> str:
+    """Escape text, then re-apply emphasis: **bold** markers and any $price."""
+    safe = _html.escape(text)
+    safe = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", safe)          # **bold**
+    safe = re.sub(r"(\$\d[\d,]*(?:\.\d{2})?)", r"<strong>\1</strong>", safe)  # $599 etc.
+    return safe
+
+
 def _build_html_body(body: str) -> str:
-    """Render plain-text body (blank-line-separated paragraphs) into styled HTML."""
+    """Render the plain-text body into a branded, styled HTML email."""
+    store_url = os.getenv("STORE_URL", "https://morsegrid-outfitters.com")
     paragraphs = [p.strip() for p in body.split("\n\n") if p.strip()]
-    inner_html = "".join(
-        f"<p style='margin:0 0 14px 0'>{p.replace(chr(10), '<br>')}</p>"
+    inner = "".join(
+        f"<p style=\"margin:0 0 16px 0\">{_style_inline(p).replace(chr(10), '<br>')}</p>"
         for p in paragraphs
     )
-    return (
-        "<div style='font-family:sans-serif;font-size:15px;line-height:1.6;"
-        "max-width:600px;margin:0 auto;padding:32px 24px;color:#222'>"
-        + inner_html
-        + "</div>"
-    )
+    return f"""\
+<div style="background:#f4f4f5;padding:24px 12px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+  <div style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e4e4e7;">
+    <div style="background:#0f172a;padding:22px 30px;">
+      <div style="color:#ffffff;font-size:19px;font-weight:800;letter-spacing:1.5px;">MORSEGRID OUTFITTERS</div>
+      <div style="color:#22c55e;font-size:11px;letter-spacing:2.5px;text-transform:uppercase;margin-top:3px;">Premium Motorcycle Gear</div>
+    </div>
+    <div style="padding:30px;color:#27272a;font-size:15px;line-height:1.65;">
+      {inner}
+      <div style="margin:26px 0 6px;">
+        <a href="{store_url}" style="display:inline-block;background:#22c55e;color:#0f172a;font-weight:700;text-decoration:none;padding:13px 26px;border-radius:8px;font-size:15px;">Complete Your Order &rarr;</a>
+      </div>
+    </div>
+    <div style="padding:16px 30px;background:#fafafa;border-top:1px solid #eee;color:#a1a1aa;font-size:12px;line-height:1.5;">
+      You're receiving this because you shopped with Morsegrid Outfitters.<br>
+      Morsegrid Outfitters &middot; Ride ready.
+    </div>
+  </div>
+</div>"""
 
 
 def send_email_resend(

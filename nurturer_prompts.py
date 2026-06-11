@@ -36,8 +36,9 @@ STEP 3 — Draft a warm, personal message (NOT a mass-marketing blast). Choose s
     history, or the exact thing they once searched for is finally in stock. Make it feel
     personal, not "we miss you" spam.
 
-Rules: name 1-2 specific products with prices; keep the body under 180 words; sound
-like a real person at the store. ALWAYS end the body with this sign-off on its own line:
+Rules: name 1-2 specific products with prices; wrap product names and prices in **double
+asterisks** so they render in bold in the email; keep the body under 180 words; sound like
+a real person at the store. ALWAYS end the body with this sign-off on its own line:
 "Best,\nThe Morsegrid Outfitters Team"
 
 STEP 4 — Return ONLY this JSON (no surrounding text):
