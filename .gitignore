@@ -15,8 +15,10 @@ __pycache__/
 credentials.json
 token.json
 
-# Internal planning notes (contain live secrets / not for public repo)
+# Internal planning / submission notes (kept local, not for public repo)
 HANDOFF.md
+PLAN.md
+SUBMISSION.md
 
 # Scratch / logs
 _tmp_*
