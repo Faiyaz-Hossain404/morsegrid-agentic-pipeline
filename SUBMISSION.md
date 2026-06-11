@@ -1,5 +1,11 @@
 # Devpost Submission Pack
 
+## Hosted project URL (for the "Try it" / testing field)
+https://morsegrid-recovery-839289631541.us-central1.run.app
+
+## Public code repository
+https://github.com/Faiyaz-Hossain404/morsegrid-agentic-pipeline
+
 ## Project name
 Morsegrid Outfitters — AI Revenue Recovery Agent
 

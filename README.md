@@ -4,7 +4,7 @@
 > **abandoned carts** and **dormant customers**. Built for the Google Cloud **Rapid Agent
 > Hackathon** — **MongoDB partner track**.
 
-**Live app:** `<CLOUD_RUN_URL>` &nbsp;·&nbsp; **Demo video:** `<YOUTUBE_URL>`
+**Live app:** https://morsegrid-recovery-839289631541.us-central1.run.app &nbsp;·&nbsp; **Demo video:** `<YOUTUBE_URL>`
 
 ---
 
