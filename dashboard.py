@@ -625,7 +625,7 @@ def main():
         render_activity_log()
 
     # ---- Header ----
-    st.markdown("##Morsegrid Outfitters — AI Revenue Recovery Agent")
+    st.markdown("## Morsegrid Outfitters — AI Revenue Recovery Agent")
     st.markdown(
         "Recovers **abandoned carts** + re-engages **dormant customers** &nbsp;·&nbsp; "
         "`Gemini 3 Flash` · `Google ADK` · `MongoDB MCP Server` · `Atlas Vector Search`"
