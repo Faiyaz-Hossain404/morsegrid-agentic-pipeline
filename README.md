@@ -63,28 +63,34 @@ Embeddings use Vertex `text-embedding-004`. The app is deployed on **Cloud Run**
    ╔════════════════════════╪═══════════════════════════════╗
    ║   ADK multi-agent app        model: GEMINI 3 FLASH      ║
    ║                                                          ║
-   ║   PLANNER ───────►  NURTURER ───────►  SENDER            ║
-   ║   (rank carts +     (read history,     (pick channel,    ║
-   ║    dormant by EV)    vector-match,      send, log)       ║
-   ║                      draft message)                      ║
-   ║       │                  │                  │            ║
-   ║   cart_scorer       find_similar_      pick_channel      ║
-   ║   lead_scorer        products (Atlas)   send_email/sms   ║
+   ║  SCORER ─► STRATEGIST ─► NURTURER ─► SENDER             ║
+   ║ (EV math)  (judgment +   (history +   (channel +        ║
+   ║            MCP fatigue    vector-match  send +           ║
+   ║            check)         draft msg)    MCP log)         ║
+   ║     │          │             │             │            ║
+   ║ cart_scorer  messages_sent find_similar  pick_channel    ║
+   ║ lead_scorer  (via MCP)     products(Atlas) send_email     ║
    ╚════════════════════════╪═══════════════════════════════╝
                             ▼
                   Streamlit dashboard  (human-in-the-loop:
                   inspect MCP trace · edit draft · approve/reject)
 ```
 
-- **Planner** (`planner.py`) — deterministic Python scoring (no LLM, to save quota): ranks
-  abandoned carts (`P(recover) × cart_value × recency`) and dormant customers
-  (`P(convert) × margin × recency`) in one comparable, sorted queue.
-- **Nurturer** (Gemini 3 + ADK + MCP) — `find`s the shopper's behavior events, runs Atlas
+- **Scorer** (`planner.py`, `tools/cart_scorer.py`, `tools/lead_scorer.py`) — deterministic
+  expected-value math (no LLM): ranks abandoned carts (`P(recover) × cart_value × recency`)
+  and dormant customers (`P(convert) × margin × recency`) in one comparable, sorted queue.
+- **Strategist agent** (Gemini 3 + ADK + MCP) — reasons over the scored queue, checks contact
+  fatigue via MCP `find`/`count` on `messages_sent`, and sets today's priority order. It applies
+  *judgment*; it never recomputes the scores (LLMs shouldn't do the arithmetic).
+- **Nurturer agent** (Gemini 3 + ADK + MCP) — `find`s the shopper's behavior events, runs Atlas
   Vector Search for the right products, and drafts a strategy-aware personalized message.
-- **Sender** — picks the channel from engagement signals (email / SMS / IG DM), delivers
-  (real email via Resend; SMS/IG mocked + labeled), and logs the result to MongoDB.
+- **Sender agent** (Gemini 3 + ADK + MCP) — picks the channel (email / SMS / IG DM), delivers
+  (real email via Resend; SMS/IG mocked + labeled), and logs the result via MCP `insert-many`.
 - **Human-in-the-loop** — the Streamlit dashboard shows every MCP tool call; you edit and
   approve or reject before anything is sent.
+
+> A sidebar toggle swaps the Strategist + Sender agents for fast deterministic versions — handy
+> for a quick demo or to save quota. The Scorer is always deterministic by design.
 
 ---
 

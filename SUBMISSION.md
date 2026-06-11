@@ -30,14 +30,20 @@ Three cooperating Gemini 3 agents work one ranked queue that mixes two opportuni
 - **Dormant customers** — warm win-backs tied to a real reason (a new arrival matching their
   history, or the item they once searched for is finally in stock).
 
-A **Planner** ranks every opportunity by expected recovered margin; a **Nurturer** (Gemini 3
-+ ADK + MongoDB MCP + Atlas Vector Search) drafts a personalized message; a human approves it
-in a Streamlit dashboard; a **Sender** picks the best channel (email/SMS/IG), delivers, and
-logs the result. It even switches an email-dead shopper to SMS automatically.
+A deterministic **Scorer** ranks every opportunity by expected recovered margin, then **three
+Gemini 3 agents** take over: a **Strategist** reasons over that ranked queue and checks contact
+fatigue (via MongoDB MCP) to set today's priorities; a **Nurturer** (MCP history + Atlas Vector
+Search) drafts a personalized message; a human approves it in a Streamlit dashboard; and a
+**Sender** picks the best channel (email/SMS/IG), delivers, and logs the result via MCP. It even
+switches an email-dead shopper to SMS automatically. *(A sidebar toggle can swap the Strategist
+and Sender for fast deterministic versions.)*
 
 ## How we built it
 - **Gemini 3 Flash** on **Vertex AI** for all agent reasoning and drafting.
-- **Google ADK** (Agent Builder, code-first) for the multi-agent orchestration and tooling.
+- **Google ADK** (Agent Builder, code-first) orchestrating three agents — **Strategist,
+  Nurturer, Sender** — and their tools.
+- **Hybrid by design:** a deterministic Scorer does the EV arithmetic (auditable, reproducible);
+  the agents apply *judgment*. We use the LLM where reasoning adds value, code where it's a formula.
 - **MongoDB MCP Server** as the agents' *only* runtime database interface (`find`,
   `aggregate`, `count`, `insert-many`).
 - **MongoDB Atlas Vector Search** over Vertex `text-embedding-004` for product matching.
@@ -76,19 +82,21 @@ autonomous mode that sends low-risk recoveries without human review.
 # Demo video script (target 2:50, hard cap 3:00)
 
 > Record at 1080p. Turn ON English captions/subtitles (required). No third-party logos.
-> Pre-step before recording: run the Planner once so the queue is warm, then reset drafts.
+> Pre-step before recording: keep "AI agents (3-agent)" ON; run the Planner once so the
+> Strategist + queue are warm, then reset drafts. (Re-seed first if you want fresh "3h ago" times.)
 
 **[0:00–0:18] Hook + problem**
 *On screen:* title slide → dashboard empty state.
 *VO:* "Online stores lose revenue two ways: nearly 70% of carts are abandoned, and past
-customers quietly go dormant. Morsegrid is an AI agent that recovers both — built on Gemini 3,
-Google ADK, and MongoDB."
+customers quietly go dormant. Morsegrid is a team of three AI agents that recovers both — built
+on Gemini 3, Google ADK, and MongoDB."
 
-**[0:18–0:40] The unified queue**
-*On screen:* click **Run Planner**; the queue fills.
-*VO:* "The Planner scans MongoDB and ranks every opportunity — abandoned carts and dormant
-customers together — by expected recovered dollars. Right now there's $2,000+ of cart value at
-risk." Point at the **Cart $ at Risk** metric.
+**[0:18–0:45] The queue + the Strategist agent**
+*On screen:* click **Run Planner**; the queue fills. Expand the **Strategist Agent** panel.
+*VO:* "A deterministic scorer ranks every opportunity by expected recovered dollars — over $2,000
+of cart value at risk. Then the first agent, the Strategist, reasons over that queue and checks
+contact fatigue in MongoDB through the MCP server to set today's priorities." Point at its MCP
+call, and the **Cart $ at Risk** metric.
 
 **[0:40–1:25] Scenario 1 — high-value cart (the MCP money shot)**
 *On screen:* open **Mike** ($599 carbon helmet, payment step). Click **Personalize Message**.

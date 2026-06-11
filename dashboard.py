@@ -44,7 +44,9 @@ from google.genai import types
 
 from db.mongo import get_db_client
 from planner import build_opportunity_queue
-from nurturer_prompts import NURTURER_INSTRUCTION, build_prompt
+from nurturer_prompts import (
+    NURTURER_INSTRUCTION, STRATEGIST_INSTRUCTION, SENDER_INSTRUCTION, build_prompt,
+)
 from tools.product_search import find_similar_products
 from tools.channel import pick_channel
 from tools.email_sender import send_email_resend
@@ -55,8 +57,10 @@ from ingest.shopify import simulate_incoming_cart
 # Config
 # ---------------------------------------------------------------------------
 
-DB_NAME        = "morsegrid_outfitters"
-NURTURER_MODEL = os.getenv("NURTURER_MODEL", "gemini-3-flash-preview")
+DB_NAME          = "morsegrid_outfitters"
+STRATEGIST_MODEL = os.getenv("STRATEGIST_MODEL", "gemini-3-flash-preview")
+NURTURER_MODEL   = os.getenv("NURTURER_MODEL",   "gemini-3-flash-preview")
+SENDER_MODEL     = os.getenv("SENDER_MODEL",     "gemini-3-flash-preview")
 APP            = "morsegrid_dashboard"
 USER_ID        = "dashboard_user"
 NPX            = shutil.which("npx") or ("npx.cmd" if sys.platform == "win32" else "npx")
@@ -183,17 +187,27 @@ def extract_json(text: str):
 
 class PlannerTask:
     def __init__(self):
-        self.result:    list | None = None
-        self.error:     str  | None = None
-        self.done:      bool        = False
-        self.cancelled: bool        = False
+        self.result:     list | None = None
+        self.error:      str  | None = None
+        self.done:       bool        = False
+        self.cancelled:  bool        = False
+        self.strategist: dict | None = None   # {trace, plan} or {error}
 
 
-def _planner_worker(task: PlannerTask):
+def _planner_worker(task: PlannerTask, agent_mode: bool = False):
     try:
-        result = build_opportunity_queue(DB_NAME)
+        scored = build_opportunity_queue(DB_NAME)
+        # 3-agent mode: the Strategist agent reasons over the EV-scored queue
+        # (judgment + MCP fatigue check). On any failure we keep the EV order.
+        if agent_mode and scored and not task.cancelled:
+            try:
+                plan, trace = run_strategist(scored[:10])
+                scored = apply_strategist_plan(scored, plan)
+                task.strategist = {"trace": trace, "plan": plan}
+            except Exception as exc:
+                task.strategist = {"error": str(exc)}
         if not task.cancelled:
-            task.result = result
+            task.result = scored
     except Exception as exc:
         if not task.cancelled:
             task.error = str(exc)
@@ -231,6 +245,64 @@ async def _nurturer_async(opp: dict):
 
 def run_nurturer(opp: dict):
     return run_async(_nurturer_async(opp))
+
+
+# ---------------------------------------------------------------------------
+# Strategist — ADK agent + MCP. Reasons over the EV-scored queue (judgment +
+# fatigue check). It does NOT recompute scores; the deterministic scorer does.
+# ---------------------------------------------------------------------------
+
+async def _strategist_async(scored_opps: list):
+    toolset = build_toolset()
+    try:
+        agent = LlmAgent(
+            name="strategist",
+            model=STRATEGIST_MODEL,
+            instruction=STRATEGIST_INSTRUCTION,
+            tools=[toolset],
+        )
+        sid = f"dash-strat-{datetime.now(timezone.utc).strftime('%H%M%S')}"
+        runner = InMemoryRunner(agent=agent, app_name=APP)
+        await runner.session_service.create_session(app_name=APP, user_id=USER_ID, session_id=sid)
+
+        payload = [{
+            "customer_id": o["customer_id"], "name": o["name"],
+            "type": o["opp_type"], "ev": o["score"], "detail": opp_detail(o),
+        } for o in scored_opps]
+        prompt = ("Today's EV-scored opportunity queue (JSON):\n"
+                  + json.dumps(payload)
+                  + "\n\nProduce the prioritized action plan now.")
+        output, tool_trace = await agent_turn(runner, sid, prompt)
+        plan = extract_json(output)
+        if not isinstance(plan, list):
+            raise ValueError("Strategist did not return a JSON list")
+        return plan, tool_trace
+    finally:
+        await toolset.close()
+
+
+def run_strategist(scored_opps: list):
+    return run_async(_strategist_async(scored_opps))
+
+
+def apply_strategist_plan(scored: list, plan: list) -> list:
+    """Re-order + annotate the scored queue using the Strategist's plan.
+    Unmentioned opportunities keep their EV order at the end (graceful)."""
+    by_id = {o["customer_id"]: o for o in scored}
+    ordered, seen = [], set()
+    for item in plan:
+        cid = item.get("customer_id") if isinstance(item, dict) else None
+        o = by_id.get(cid)
+        if o and cid not in seen:
+            ordered.append({**o,
+                            "strategist_action": item.get("action", "contact"),
+                            "strategist_reason": item.get("reason", "")})
+            seen.add(cid)
+    for o in scored:
+        if o["customer_id"] not in seen:
+            ordered.append(o)
+            seen.add(o["customer_id"])
+    return ordered
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +360,61 @@ def _send_direct(opp: dict, draft: dict):
         {"tool": "mongodb.insert_one", "args": {"collection": "messages_sent", "status": status}, "is_mcp": False},
     ]
     return f"Sent to {opp['name']} via {channel} — {send_label}.", tool_trace, channel, decision["reason"]
+
+
+# ---------------------------------------------------------------------------
+# Sender — AI agent variant (Gemini + ADK + MCP). Picks the channel, delivers,
+# and logs the delivery to MongoDB via the MCP insert-many tool.
+# ---------------------------------------------------------------------------
+
+async def _send_agent_async(opp: dict, draft: dict):
+    toolset = build_toolset()
+    try:
+        agent = LlmAgent(
+            name="sender",
+            model=SENDER_MODEL,
+            instruction=SENDER_INSTRUCTION,
+            tools=[toolset, pick_channel, send_email_resend, send_sms_mock, send_ig_dm_mock],
+        )
+        sid = f"dash-snd-{opp['customer_id']}-{datetime.now(timezone.utc).strftime('%H%M%S')}"
+        runner = InMemoryRunner(agent=agent, app_name=APP)
+        await runner.session_service.create_session(app_name=APP, user_id=USER_ID, session_id=sid)
+        prompt = (
+            f"Customer ID: {opp['customer_id']} | Name: {opp['name']} | Opp type: {opp['opp_type']} | "
+            f"Email: {opp.get('email','')} | Phone: {opp.get('phone','N/A')} | "
+            f"IG handle: {opp.get('ig_handle','N/A')} | Segment: {opp.get('segment','cold')} | "
+            f"SMS opted in: {opp.get('sms_opted_in', False)} | "
+            f"Email opens last 30d: {opp.get('email_opens_last_30d', 0)}. "
+            f"Subject: {draft.get('subject','')} | Body: {draft.get('body','')} "
+            f"Send this message and log it now."
+        )
+        output, tool_trace = await agent_turn(runner, sid, prompt)
+        return output, tool_trace
+    finally:
+        await toolset.close()
+
+
+def run_sender_agent(opp: dict, draft: dict):
+    output, tool_trace = run_async(_send_agent_async(opp, draft))
+    channel = "email"
+    m = re.search(r"CHANNEL=(\w+)", output or "")
+    if m:
+        channel = m.group(1).lower()
+    else:  # fall back to whichever send tool the agent called
+        for t in tool_trace:
+            if t["tool"] in ("send_sms_mock", "send_email_resend", "send_ig_dm_mock"):
+                channel = {"send_sms_mock": "sms", "send_ig_dm_mock": "ig_dm"}.get(t["tool"], "email")
+    if channel not in ("email", "sms", "ig_dm"):
+        channel = "email"
+    # Close the loop on the cart (the agent already logged messages_sent via MCP).
+    if opp.get("opp_type") == "abandoned_cart" and opp.get("cart_id"):
+        try:
+            get_db_client()[DB_NAME]["abandoned_carts"].update_one(
+                {"cart_id": opp["cart_id"]}, {"$set": {"recovery_status": "sent"}})
+        except Exception:
+            pass
+    return (f"Sent to {opp['name']} via {channel} (Sender agent).",
+            tool_trace, channel, "Channel chosen by the Sender agent")
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +502,7 @@ def main():
         ("leads", []), ("drafts", {}), ("sent", {}),
         ("errors", {}), ("activity_log", []),
         ("is_planning", False), ("planner_task", None),
-        ("force_expanded", set()), ("reject_count", 0),
+        ("force_expanded", set()), ("reject_count", 0), ("strategist", None),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -391,8 +518,13 @@ def main():
                 st.session_state.drafts = {}
                 st.session_state.sent   = {}
                 st.session_state.errors = {}
+                st.session_state.strategist = task.strategist
                 n_cart = sum(1 for o in task.result if o["opp_type"] == "abandoned_cart")
-                log_event("success", f"Planner ranked {len(task.result)} opportunities ({n_cart} carts)")
+                if task.strategist and task.strategist.get("trace"):
+                    smcp = sum(1 for t in task.strategist["trace"] if t.get("is_mcp"))
+                    log_event("success", f"Strategist prioritized {len(task.result)} opportunities ({smcp} MCP calls)")
+                else:
+                    log_event("success", f"Planner ranked {len(task.result)} opportunities ({n_cart} carts)")
                 st.toast(f"Ranked {len(task.result)} recovery opportunities", icon="✅")
             elif task.error:
                 log_event("error", f"Planner failed: {task.error}")
@@ -408,6 +540,12 @@ def main():
             value=True,
             help="Pins the 5 hero scenarios (C001–C005) to the top of the queue",
         )
+        agent_mode = st.toggle(
+            "AI agents (3-agent)",
+            value=True,
+            help="ON: Strategist + Nurturer + Sender all run as Gemini agents via MCP "
+                 "(richer multi-agent flow, slower). OFF: fast deterministic Planner + Sender.",
+        )
 
         st.divider()
 
@@ -416,7 +554,7 @@ def main():
                 task = PlannerTask()
                 st.session_state.planner_task = task
                 st.session_state.is_planning  = True
-                threading.Thread(target=_planner_worker, args=(task,), daemon=True).start()
+                threading.Thread(target=_planner_worker, args=(task, agent_mode), daemon=True).start()
                 log_event("info", "Planner started")
                 st.rerun()
         else:
@@ -509,31 +647,36 @@ def main():
             st.info("Click **Run Planner** in the sidebar to find and rank revenue-recovery opportunities.",
                     icon=":material/info:")
             st.markdown("""
-**How it works — four steps:**
+**How it works — three Gemini agents + you:**
 
-**1 · Planner** — scans MongoDB for two kinds of lost revenue and ranks them in one queue:
+**0 · Scorer** *(deterministic math)* — scores every opportunity by expected value:
 > 🛒 **Abandoned carts** — `P(recover) × cart value × recency`
 > 💤 **Dormant customers** — `P(convert) × margin × recency`
 
-**2 · Nurturer** *(Gemini 3 Flash + ADK + MongoDB MCP)* — reads the shopper's behavior via
-MCP `find`, runs Atlas Vector Search for the right products (the exact item, in-stock
-alternatives, or a complement), and drafts a personalized message.
+**1 · Strategist agent** *(Gemini 3 + ADK + MCP)* — reasons over the scored queue, checks
+contact fatigue via MCP `find`, and sets today's priority order.
+
+**2 · Nurturer agent** *(Gemini 3 + ADK + MCP)* — reads the shopper's behavior via MCP `find`,
+runs Atlas Vector Search, and drafts a personalized message.
 
 **3 · You review** — inspect every tool call in the Agent Reasoning Trace. Edit. Approve or reject.
 
-**4 · Sender** — picks the best channel (email / SMS / IG DM), delivers, and logs to MongoDB.
+**4 · Sender agent** *(Gemini 3 + ADK + MCP)* — picks the channel (email / SMS / IG DM),
+delivers, and logs to MongoDB via MCP `insert-many`.
+
+*Toggle **AI agents (3-agent)** off in the sidebar for a fast deterministic Planner + Sender.*
             """)
         with right:
             st.markdown("#### Stack")
             st.markdown("""
 | Component | Technology |
 |-----------|-----------|
+| Agents | Strategist · Nurturer · Sender |
 | Orchestration | Google ADK |
 | LLM | Gemini 3 Flash |
 | DB Operations | MongoDB MCP Server |
 | Vector Search | Atlas + text-embedding-004 |
 | Cart ingestion | Shopify-style webhook |
-| Email Delivery | Resend API |
             """)
         return
 
@@ -566,6 +709,18 @@ alternatives, or a complement), and drafts a personalized message.
         display = opps
 
     max_ev = max((o["score"] for o in display), default=1)
+
+    strat = st.session_state.get("strategist")
+    if strat and strat.get("trace"):
+        smcp = sum(1 for t in strat["trace"] if t.get("is_mcp"))
+        with st.expander(
+            f":material/strategy: Strategist Agent — reasoned over the queue "
+            f"({smcp} MCP call{'s' if smcp != 1 else ''} · contact-fatigue check)", expanded=False):
+            render_trace(strat["trace"])
+            st.caption("The Strategist agent queried `messages_sent` via MCP to check contact fatigue, "
+                       "then re-prioritized the EV-scored queue. Scores stay deterministic — the agent applies judgment.")
+    elif strat and strat.get("error"):
+        st.caption(f":material/info: Strategist agent unavailable — showing pure EV order. ({strat['error'][:90]})")
 
     st.subheader("Revenue Recovery Queue")
 
@@ -618,6 +773,10 @@ alternatives, or a complement), and drafts a personalized message.
             ev_pct = min(opp["score"] / max_ev, 1.0) if max_ev > 0 else 0.0
             st.progress(ev_pct, text=f"EV: **${opp['score']}** / ${max_ev} top opportunity")
             st.caption(f"**Why this opportunity:** {opp['rationale']}")
+            if opp.get("strategist_reason"):
+                _skip = opp.get("strategist_action") == "skip"
+                _icon = ":material/block:" if _skip else ":material/strategy:"
+                st.caption(f"{_icon} **Strategist agent:** {opp['strategist_reason']}")
 
             if opp.get("behavior_summary"):
                 st.info(f"**Behavior signal:** {opp['behavior_summary']}", icon=":material/psychology:")
@@ -695,7 +854,10 @@ alternatives, or a complement), and drafts a personalized message.
                                 st.write(":material/save: Logging delivery to MongoDB…")
                                 try:
                                     edited = {**draft, "body": st.session_state.get(f"body_{cid}", draft.get("body", ""))}
-                                    result, sender_trace, channel, reason = _send_direct(opp, edited)
+                                    if agent_mode:
+                                        result, sender_trace, channel, reason = run_sender_agent(opp, edited)
+                                    else:
+                                        result, sender_trace, channel, reason = _send_direct(opp, edited)
                                     ch_label = CHANNEL_LABELS.get(channel, ":material/mail: DELIVERED")
                                     st.session_state.sent[cid] = {
                                         "result": result, "channel": channel,
