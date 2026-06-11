@@ -771,7 +771,7 @@ delivers, and logs to MongoDB via MCP `insert-many`.
                 mc4.metric("Lifetime Orders", opp.get("total_orders", 0))
 
             ev_pct = min(opp["score"] / max_ev, 1.0) if max_ev > 0 else 0.0
-            st.progress(ev_pct, text=f"EV: **${opp['score']}** / ${max_ev} top opportunity")
+            st.progress(ev_pct, text=f"EV: ${opp['score']} / ${max_ev} top opportunity")
             st.caption(f"**Why this opportunity:** {opp['rationale']}")
             if opp.get("strategist_reason"):
                 _skip = opp.get("strategist_action") == "skip"
